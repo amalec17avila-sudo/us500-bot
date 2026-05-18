@@ -1,6 +1,6 @@
 """
 ================================================================
-  US500 MARKET MONITOR BOT v3.7 — RAILWAY PRODUCTION
+  US500 MARKET MONITOR BOT v3.8 — RAILWAY PRODUCTION
   Autor: Amalec (revisado y mejorado por Claude)
 
   Variables de entorno requeridas en Railway:
@@ -513,14 +513,48 @@ def posicion_rango_diario(spy, high, low, minutos_apertura):
     return {"posicion_pct": round(float(posicion), 1),
             "max_dia": round(max_dia, 2), "min_dia": round(min_dia, 2), "score": score}
 
-def filtro_tendencia(spy, ventana_ema=20):
+def filtro_tendencia(spy, ventana_ema=20, ventana_minimos=30):
+    """
+    Filtro de tendencia agresivo v3.8:
+    - Detecta mínimos más bajos consecutivos bajo la EMA20
+    - Si hay tendencia bajista clara, penaliza score alcista en -4 pts
+    - Si precio está bajo Gamma Flip Y haciendo mínimos más bajos = tendencia bajista confirmada
+    """
     if len(spy) < ventana_ema + 1:
-        return {"precio_vs_ema": 0.0, "sobre_ema": True, "penalizacion": 0}
+        return {"precio_vs_ema": 0.0, "sobre_ema": True, "penalizacion": 0,
+                "minimos_bajistas": False, "tendencia_bajista_fuerte": False}
+
     ema20      = float(ema(spy, ventana_ema).iloc[-1])
     precio_act = float(spy.iloc[-1])
     diff_pct   = (precio_act - ema20) / ema20 * 100
-    return {"ema20": round(ema20, 2), "precio_vs_ema": round(diff_pct, 3),
-            "sobre_ema": precio_act > ema20, "penalizacion": 0}
+    sobre_ema  = precio_act > ema20
+
+    # Detectar mínimos más bajos en los últimos 30 minutos
+    minimos_bajistas = False
+    tendencia_bajista_fuerte = False
+
+    if len(spy) >= ventana_minimos:
+        # Dividir en 3 segmentos y comparar mínimos
+        seg = ventana_minimos // 3
+        min1 = float(spy.iloc[-ventana_minimos:-2*seg].min())
+        min2 = float(spy.iloc[-2*seg:-seg].min())
+        min3 = float(spy.iloc[-seg:].min())
+
+        # Si cada segmento tiene mínimo más bajo = tendencia bajista
+        if min3 < min2 < min1:
+            minimos_bajistas = True
+            # Si además está bajo la EMA20 = tendencia bajista fuerte
+            if not sobre_ema:
+                tendencia_bajista_fuerte = True
+
+    return {
+        "ema20":                    round(ema20, 2),
+        "precio_vs_ema":            round(diff_pct, 3),
+        "sobre_ema":                sobre_ema,
+        "minimos_bajistas":         minimos_bajistas,
+        "tendencia_bajista_fuerte": tendencia_bajista_fuerte,
+        "penalizacion":             0,
+    }
 
 # ── Score combinado ──────────────────────────────────────────
 vix_ratio_historia = []
@@ -596,11 +630,29 @@ def calcular_score_total(datos, minutos_apertura):
     elif score_raw < 0 and val_rsi < 25: penalizacion_rsi =  2
     score_raw += penalizacion_rsi
 
+    # v3.8: Filtro de tendencia AGRESIVO
     penalizacion_tendencia = 0
-    if score_raw > 0 and not tendencia["sobre_ema"]:   penalizacion_tendencia = -2
-    elif score_raw < 0 and tendencia["sobre_ema"]:     penalizacion_tendencia =  2
-    score_raw += penalizacion_tendencia
+    if tendencia["tendencia_bajista_fuerte"]:
+        # Tendencia bajista fuerte (mínimos más bajos + bajo EMA20)
+        if score_raw > 0:
+            penalizacion_tendencia = -4  # Penalización fuerte
+        # Forzar score bajista si también está bajo el Gamma Flip
+        if gex.get("disponible") and gex.get("distancia_flip") is not None:
+            if gex["distancia_flip"] < 0:  # bajo el Gamma Flip
+                penalizacion_tendencia = -6  # Penalización muy fuerte
+    elif tendencia["minimos_bajistas"] and not tendencia["sobre_ema"]:
+        # Mínimos bajistas + bajo EMA20 (sin confirmar fuerte aún)
+        if score_raw > 0:
+            penalizacion_tendencia = -3
+    elif not tendencia["sobre_ema"]:
+        # Solo bajo EMA20
+        if score_raw > 0:
+            penalizacion_tendencia = -2
+    elif tendencia["sobre_ema"] and score_raw < 0:
+        # Sobre EMA20 pero score bajista
+        penalizacion_tendencia = 2
 
+    score_raw += penalizacion_tendencia
     score_final = max(-10, min(10, score_raw))
 
     return {
@@ -755,6 +807,8 @@ def analizar_con_claude(resultado):
     gex_str  = f"GEX Flip:{gex.get('gamma_flip')} Call:{gex.get('call_wall')} Put:{gex.get('put_wall')} | {gex.get('señal','')}" if gex.get("disponible") else "GEX:N/D"
     dp_str   = f"DarkPool:{dp.get('ratio',0):.1%} {dp.get('interpretacion','')}" if dp.get("disponible") else "DarkPool:N/D"
     tend_str = f"EMA20:{tend.get('ema20','?')} {'SOBRE' if tend.get('sobre_ema') else 'BAJO'}"
+    if tend.get("tendencia_bajista_fuerte"): tend_str += " ⚠️TENDENCIA BAJISTA FUERTE"
+    elif tend.get("minimos_bajistas"): tend_str += " ⚠️MINIMOS BAJISTAS"
 
     macro_impacto  = contexto_macro.get("impacto", "NEUTRAL")
     macro_resumen  = contexto_macro.get("resumen", "")
@@ -783,7 +837,7 @@ Responde en español, 5 párrafos cortos, sin asteriscos:
 
     try:
         respuesta = claude_client.messages.create(
-            model=MODELO_SEÑALES, max_tokens=700,
+            model=MODELO_SEÑALES, max_tokens=1000,
             messages=[{"role": "user", "content": prompt}]
         )
         return respuesta.content[0].text
@@ -793,7 +847,7 @@ Responde en español, 5 párrafos cortos, sin asteriscos:
             time.sleep(15)
             try:
                 respuesta = claude_client.messages.create(
-                    model=MODELO_SEÑALES, max_tokens=700,
+                    model=MODELO_SEÑALES, max_tokens=1000,
                     messages=[{"role": "user", "content": prompt}]
                 )
                 return respuesta.content[0].text
@@ -822,7 +876,12 @@ def enviar_alerta_score(resultado, analisis_claude):
     if pen_rsi  != 0: pen_lines += f"\n⚠️ RSI extremo ({detalle['rsi']}) — ajustado {pen_rsi:+d} pts"
     if pen_tend != 0:
         tend = detalle["tendencia"]
-        pen_lines += f"\n📐 Precio {'bajo' if pen_tend<0 else 'sobre'} EMA20 ({tend.get('ema20','?')}) — ajustado {pen_tend:+d} pts"
+        if tend.get("tendencia_bajista_fuerte"):
+            pen_lines += f"\n📐 TENDENCIA BAJISTA FUERTE — ajustado {pen_tend:+d} pts"
+        elif tend.get("minimos_bajistas"):
+            pen_lines += f"\n📐 Mínimos bajistas bajo EMA20 — ajustado {pen_tend:+d} pts"
+        else:
+            pen_lines += f"\n📐 Precio {'bajo' if pen_tend<0 else 'sobre'} EMA20 ({tend.get('ema20','?')}) — ajustado {pen_tend:+d} pts"
 
     vix_r = detalle["vix_ratio"]
     vix_str = f"\n📐 VIX/VIX3M: `{vix_r['ratio']}`" + (" ⚠️fat" if vix_r.get("fatiga") else "") if vix_r.get("disponible") else ""
@@ -856,13 +915,20 @@ def enviar_alerta_score(resultado, analisis_claude):
            f"{vix_str}{move_str}{dxy_str}{gex_str}{dp_str}{liq_str}\n"
            f"📍 Rango: `{detalle['posicion_rango']['posicion_pct']}%`\n"
            f"🌍 Macro: {macro_emoji} `{macro_impacto.replace('_',' ')}`{pen_lines}\n"
-           f"{'─'*28}\n*Señales activas:*\n{senales_str}\n{'─'*28}\n"
-           f"*Análisis:*\n\n{analisis_claude}")
+           f"{'─'*28}\n*Señales activas:*\n{senales_str}")
     if len(msg) > 4096: msg = msg[:4090] + "..."
     try: bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
     except:
         try: bot.send_message(TELEGRAM_CHAT_ID, msg.replace("*","").replace("`","").replace("_",""))
         except Exception as e: print(f"  [ALERTA] Telegram error: {e}")
+
+    # Enviar análisis en mensaje separado — así nunca se corta
+    analisis_msg = f"📋 *Análisis:*\n\n{analisis_claude}"
+    if len(analisis_msg) > 4096: analisis_msg = analisis_msg[:4090] + "..."
+    try: bot.send_message(TELEGRAM_CHAT_ID, analisis_msg, parse_mode="Markdown")
+    except:
+        try: bot.send_message(TELEGRAM_CHAT_ID, analisis_msg.replace("*","").replace("`",""))
+        except Exception as e: print(f"  [ANALISIS] Telegram error: {e}")
 
 # ── Detector de agotamiento ──────────────────────────────────
 estado_agotamiento = {
@@ -989,9 +1055,11 @@ contador_ciclos        = 0
 cooldown               = EstadoCooldown()
 
 print("=" * 60)
-print("   US500 MONITOR v3.7 — RAILWAY PRODUCTION 24/7")
+print("   US500 MONITOR v3.8 — FILTRO TENDENCIA AGRESIVO")
 print("=" * 60)
 print("  GEX + Dark Pool + Macro + DXY + MOVE + Liquidez")
+print("  NUEVO v3.8: Filtro tendencia agresivo — señales bajistas")
+print("  cuando precio hace minimos mas bajos bajo Gamma Flip")
 print(f"  Umbral: ±{UMBRAL_SCORE}/10 | Min entre alertas: {TIEMPO_MIN_ALERTAS} min")
 print("=" * 60)
 
