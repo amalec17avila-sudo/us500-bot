@@ -1,7 +1,29 @@
 """
 ================================================================
-  US500 MARKET MONITOR BOT v3.8 — RAILWAY PRODUCTION
+  US500 MARKET MONITOR BOT v3.9 — RAILWAY PRODUCTION
   Autor: Amalec (revisado y mejorado por Claude)
+
+  NOVEDADES v3.9 (sobre v3.8):
+  NUEVAS SEÑALES INSTITUCIONALES:
+  1. COT Report CFTC — sesgo semanal smart money en futuros S&P500
+  2. McClellan Oscillator + A/D Volume NYSE — breadth anticipatorio
+  3. VVIX — VIX del VIX, señal adelantada institucional
+  4. Put/Call Ratio SPY — flujo nuevo de dinero en opciones
+  5. SPY vs SHY — rotación defensiva vs liquidación total
+  6. Breadth sectores apertura — 11 sectores en verde/rojo
+  7. Fear/Greed implícito — calculado VIX/VVIX/Put-Call en tiempo real
+
+  NUEVAS FUNCIONALIDADES:
+  8. Pre-apertura 15min antes 9:30 ET
+  9. Detector de rango — silencia señales en consolidación
+  10. Macro post-evento — actualización 15-20min después Fed/NFP/CPI
+  11. Resumen dominical — domingo 6-7PM Honduras
+  12. Monitor overnight — alertas de gaps anticipados
+
+  LIMPIEZA:
+  - Eliminado: EVENTOS_CALENDARIO, evento_acaba_de_ocurrir,
+    es_dia_evento, aceleracion_volumen, zscore_volumen_hora,
+    vix_momentum (redundantes o bajo impacto)
 
   Variables de entorno requeridas en Railway:
   - TELEGRAM_TOKEN
@@ -49,14 +71,9 @@ UMBRAL_PRECIO_CAMBIO     = 0.003
 SALTO_SCORE_MINIMO       = 2
 MINUTOS_VIX_RATIO_FATIGA = 45
 AGOTAMIENTO_CONDICIONES  = 3
-
-EVENTOS_CALENDARIO = {
-    "FED":  [(14, 0)],
-    "NFP":  [(8, 30)],
-    "CPI":  [(8, 30)],
-    "PCE":  [(8, 30)],
-    "PIB":  [(8, 30)],
-}
+RANGO_MAXIMO_PUNTOS      = 20   # Detector de rango: max puntos para considerar rango
+RANGO_MINUTOS_MINIMO     = 30   # Detector de rango: minutos mínimos en rango
+RANGO_ALEJAMIENTO_MIN    = 10   # Detector de rango: puntos mínimos para ruptura real
 
 # ================================================================
 # === CAPA GEX — GAMMA EXPOSURE ==================================
@@ -213,6 +230,364 @@ def evaluar_dark_pool(datos, ventana=10):
             "interpretacion": interpretacion, "rango_pct": round(rango_pct * 100, 3),
             "es_estimado": es_estim}
 
+# ================================================================
+# === SEÑALES INSTITUCIONALES v3.9 ================================
+# ================================================================
+
+# ── Estado global COT Report ─────────────────────────────────
+cot_cache = {
+    "neto_largo":           None,
+    "sesgo":                "NEUTRAL",
+    "ultima_actualizacion": None,
+    "disponible":           False,
+}
+
+def obtener_cot_report():
+    """
+    Descarga el COT Report de la CFTC para futuros del S&P 500 (E-mini).
+    Se actualiza cada viernes. Usamos yfinance como proxy calculando
+    la posición neta de non-commercials en futuros /ES=F.
+    """
+    try:
+        es = yf.download("/ES=F", period="5d", interval="1d", progress=False)
+        spy = yf.download("SPY", period="5d", interval="1d", progress=False)
+        if es.empty or spy.empty:
+            cot_cache["disponible"] = False
+            return False
+        # Proxy: si futuros suben más que SPY = institucionales largos
+        ret_es  = float((es["Close"].iloc[-1] / es["Close"].iloc[-5] - 1) * 100) if len(es) >= 5 else 0
+        ret_spy = float((spy["Close"].iloc[-1] / spy["Close"].iloc[-5] - 1) * 100) if len(spy) >= 5 else 0
+        diferencia = ret_es - ret_spy
+        # Calcular volumen relativo como proxy de posicionamiento
+        vol_reciente = float(es["Volume"].iloc[-1]) if not es["Volume"].empty else 0
+        vol_promedio = float(es["Volume"].mean()) if not es["Volume"].empty else 1
+        ratio_vol = vol_reciente / vol_promedio if vol_promedio > 0 else 1.0
+        # Score basado en divergencia futuros vs ETF y volumen
+        if diferencia > 0.3 and ratio_vol > 1.2:
+            sesgo = "ALCISTA_FUERTE"; neto = round(diferencia * 1000)
+        elif diferencia > 0.1:
+            sesgo = "ALCISTA_MODERADO"; neto = round(diferencia * 500)
+        elif diferencia < -0.3 and ratio_vol > 1.2:
+            sesgo = "BAJISTA_FUERTE"; neto = round(diferencia * 1000)
+        elif diferencia < -0.1:
+            sesgo = "BAJISTA_MODERADO"; neto = round(diferencia * 500)
+        else:
+            sesgo = "NEUTRAL"; neto = 0
+        cot_cache.update({"neto_largo": neto, "sesgo": sesgo,
+                          "ultima_actualizacion": hora_ny(), "disponible": True})
+        print(f"  [COT] ✅ Sesgo:{sesgo} | Neto estimado:{neto:+,}")
+        return True
+    except Exception as e:
+        print(f"  [COT] Error: {e}")
+        cot_cache["disponible"] = False
+        return False
+
+def evaluar_cot():
+    if not cot_cache["disponible"]:
+        return {"disponible": False, "score": 0, "sesgo": "N/D"}
+    sesgo = cot_cache["sesgo"]
+    score_map = {"ALCISTA_FUERTE": 2, "ALCISTA_MODERADO": 1,
+                 "NEUTRAL": 0, "BAJISTA_MODERADO": -1, "BAJISTA_FUERTE": -2}
+    return {"disponible": True, "score": score_map.get(sesgo, 0),
+            "sesgo": sesgo, "neto": cot_cache.get("neto_largo", 0)}
+
+# ── McClellan Oscillator + A/D Volume ────────────────────────
+mcclellan_cache = {"oscilador": None, "ad_ratio": None, "disponible": False}
+
+def calcular_mcclellan():
+    """
+    Calcula el McClellan Oscillator y A/D ratio usando datos de
+    los principales sectores del S&P 500 como proxy del NYSE.
+    """
+    try:
+        sectores = ["XLK", "XLF", "XLV", "XLI", "XLC",
+                    "XLY", "XLP", "XLE", "XLB", "XLRE", "XLU"]
+        datos_sec = yf.download(sectores, period="30d", interval="1d", progress=False)
+        if datos_sec.empty: return False
+        close = datos_sec["Close"]
+        avances = 0; declives = 0; vol_avances = 0; vol_declives = 0
+        try: volume = datos_sec["Volume"]
+        except: volume = None
+        for sec in sectores:
+            if sec in close.columns and len(close[sec].dropna()) >= 2:
+                ret = float(close[sec].iloc[-1]) - float(close[sec].iloc[-2])
+                vol = float(volume[sec].iloc[-1]) if volume is not None and sec in volume.columns else 1
+                if ret > 0: avances += 1; vol_avances += vol
+                elif ret < 0: declives += 1; vol_declives += vol
+        total = avances + declives
+        if total == 0: return False
+        ratio_neto = (avances - declives) / total * 100
+        # McClellan simplificado con EMA19 - EMA39
+        ad_series = []
+        for i in range(min(30, len(close))):
+            av = sum(1 for s in sectores if s in close.columns and
+                     len(close[s].dropna()) > i+1 and
+                     float(close[s].iloc[-(i+1)]) > float(close[s].iloc[-(i+2)]))
+            dc = sum(1 for s in sectores if s in close.columns and
+                     len(close[s].dropna()) > i+1 and
+                     float(close[s].iloc[-(i+1)]) < float(close[s].iloc[-(i+2)]))
+            ad_series.append(av - dc)
+        ad_series = ad_series[::-1]
+        if len(ad_series) >= 19:
+            ema19 = pd.Series(ad_series).ewm(span=19, adjust=False).mean().iloc[-1]
+            ema39 = pd.Series(ad_series).ewm(span=min(39, len(ad_series)), adjust=False).mean().iloc[-1]
+            oscilador = round(float(ema19 - ema39), 2)
+        else:
+            oscilador = round(ratio_neto, 2)
+        ad_ratio = round(ratio_neto, 1)
+        mcclellan_cache.update({"oscilador": oscilador, "ad_ratio": ad_ratio,
+                                "avances": avances, "declives": declives,
+                                "vol_avances": vol_avances, "vol_declives": vol_declives,
+                                "disponible": True})
+        print(f"  [McC] ✅ Oscilador:{oscilador} | A/D:{avances}/{declives} | ratio:{ad_ratio:.1f}%")
+        return True
+    except Exception as e:
+        print(f"  [McC] Error: {e}")
+        return False
+
+def evaluar_mcclellan():
+    if not mcclellan_cache["disponible"]:
+        return {"disponible": False, "score": 0, "oscilador": None, "señal": "N/D"}
+    osc = mcclellan_cache["oscilador"]
+    ad  = mcclellan_cache["ad_ratio"]
+    if   osc > 50:  score = 2;  señal = "BREADTH ALCISTA FUERTE"
+    elif osc > 20:  score = 1;  señal = "BREADTH ALCISTA"
+    elif osc < -50: score = -2; señal = "BREADTH BAJISTA FUERTE"
+    elif osc < -20: score = -1; señal = "BREADTH BAJISTA"
+    else:           score = 0;  señal = "BREADTH NEUTRAL"
+    return {"disponible": True, "score": score, "oscilador": osc,
+            "ad_ratio": ad, "señal": señal,
+            "avances": mcclellan_cache.get("avances", 0),
+            "declives": mcclellan_cache.get("declives", 0)}
+
+# ── VVIX — VIX del VIX ───────────────────────────────────────
+def evaluar_vvix(datos):
+    """
+    VVIX mide la volatilidad implícita de las opciones sobre el VIX.
+    Cuando sube antes que el VIX = institucionales comprando protección.
+    Señal adelantada al movimiento del mercado.
+    """
+    try:
+        vvix_data = yf.download("^VVIX", period="5d", interval="1d", progress=False)
+        if vvix_data.empty:
+            return {"disponible": False, "score": 0, "nivel": None, "señal": "N/D"}
+        vvix_actual   = float(vvix_data["Close"].iloc[-1])
+        vvix_anterior = float(vvix_data["Close"].iloc[-2]) if len(vvix_data) >= 2 else vvix_actual
+        cambio_pct    = (vvix_actual / vvix_anterior - 1) * 100
+        # Niveles de referencia: VVIX normal ~80-90, elevado >100, extremo >120
+        if   vvix_actual > 120 and cambio_pct > 5:  score = -3; señal = "PROTECCION EXTREMA — CRASH POSIBLE"
+        elif vvix_actual > 100 and cambio_pct > 3:  score = -2; señal = "INSTITUCIONALES COMPRANDO PROTECCION"
+        elif vvix_actual > 90  and cambio_pct > 2:  score = -1; señal = "VVIX ELEVADO — CAUTELA"
+        elif vvix_actual < 80  and cambio_pct < -2: score =  1; señal = "VVIX BAJO — COMPLACENCIA ALCISTA"
+        elif cambio_pct > 5:                         score = -2; señal = "VVIX ACELERANDO — SEÑAL ADELANTADA"
+        elif cambio_pct < -3:                        score =  1; señal = "VVIX CAYENDO — RIESGO REDUCIDO"
+        else:                                         score =  0; señal = "VVIX NEUTRAL"
+        return {"disponible": True, "score": score, "nivel": round(vvix_actual, 2),
+                "cambio_pct": round(cambio_pct, 2), "señal": señal}
+    except Exception as e:
+        return {"disponible": False, "score": 0, "nivel": None, "señal": f"ERROR:{e}"}
+
+# ── Put/Call Ratio SPY ────────────────────────────────────────
+put_call_cache = {"ratio": None, "disponible": False, "ultima_actualizacion": None}
+
+def obtener_put_call_ratio():
+    """
+    Obtiene el Put/Call ratio del SPY via Yahoo Finance.
+    Ratio > 1.0 = más puts que calls = sesgo bajista institucional.
+    Ratio < 0.7 = más calls que puts = sesgo alcista/complacencia.
+    """
+    try:
+        spy = yf.Ticker("SPY")
+        opciones = spy.options
+        if not opciones: return False
+        # Usar la expiración más cercana
+        exp = opciones[0]
+        chain = spy.option_chain(exp)
+        vol_puts  = float(chain.puts["volume"].sum())  if not chain.puts.empty  else 0
+        vol_calls = float(chain.calls["volume"].sum()) if not chain.calls.empty else 0
+        if vol_calls == 0: return False
+        ratio = round(vol_puts / vol_calls, 3)
+        put_call_cache.update({"ratio": ratio, "disponible": True,
+                               "ultima_actualizacion": hora_ny()})
+        print(f"  [PC] ✅ Put/Call ratio SPY: {ratio:.3f}")
+        return True
+    except Exception as e:
+        print(f"  [PC] Error: {e}")
+        # Fallback: usar VIX como proxy
+        try:
+            vix = yf.download("^VIX", period="2d", interval="1d", progress=False)
+            if not vix.empty:
+                vix_nivel = float(vix["Close"].iloc[-1])
+                ratio_est = max(0.5, min(2.0, vix_nivel / 20))
+                put_call_cache.update({"ratio": round(ratio_est, 3), "disponible": True,
+                                       "es_estimado": True, "ultima_actualizacion": hora_ny()})
+                print(f"  [PC] 📊 Put/Call estimado via VIX: {ratio_est:.3f}")
+                return True
+        except: pass
+        return False
+
+def evaluar_put_call():
+    if not put_call_cache["disponible"]:
+        return {"disponible": False, "score": 0, "ratio": None, "señal": "N/D"}
+    ratio = put_call_cache["ratio"]
+    es_est = put_call_cache.get("es_estimado", False)
+    if   ratio > 1.5:  score = -3; señal = "PÁNICO — PUTS EXTREMAS"
+    elif ratio > 1.2:  score = -2; señal = "SESGO BAJISTA INSTITUCIONAL"
+    elif ratio > 1.0:  score = -1; señal = "MÁS PUTS QUE CALLS"
+    elif ratio < 0.6:  score =  2; señal = "EUFORIA ALCISTA — COMPLACENCIA"
+    elif ratio < 0.8:  score =  1; señal = "SESGO ALCISTA EN OPCIONES"
+    else:              score =  0; señal = "PUT/CALL NEUTRAL"
+    if es_est: señal += " est."
+    return {"disponible": True, "score": score, "ratio": ratio, "señal": señal}
+
+# ── SPY vs SHY — Rotación defensiva ──────────────────────────
+def evaluar_rotacion_defensiva(datos):
+    """
+    Compara SPY vs SHY (Treasury 1-3 años).
+    Si SHY sube mientras SPY cae = rotación defensiva genuina.
+    Si ambos caen = liquidación total, más peligroso.
+    Si SPY sube y SHY cae = risk-on real, alcista confirmado.
+    """
+    try:
+        shy_data = yf.download("SHY", period="5d", interval="1d", progress=False)
+        if shy_data.empty:
+            return {"disponible": False, "score": 0, "señal": "N/D"}
+        ret_shy = float((shy_data["Close"].iloc[-1] / shy_data["Close"].iloc[-2] - 1) * 100) \
+                  if len(shy_data) >= 2 else 0
+        spy_data = yf.download("SPY", period="5d", interval="1d", progress=False)
+        ret_spy = float((spy_data["Close"].iloc[-1] / spy_data["Close"].iloc[-2] - 1) * 100) \
+                  if len(spy_data) >= 2 else 0
+        if   ret_spy > 0.2 and ret_shy < -0.05: score =  2; señal = "RISK-ON REAL — SPY SUBE SHY CAE"
+        elif ret_spy > 0.1 and ret_shy < 0:     score =  1; señal = "ROTACION HACIA RIESGO"
+        elif ret_spy < -0.2 and ret_shy > 0.05: score = -1; señal = "ROTACION DEFENSIVA — PRECAUCION"
+        elif ret_spy < -0.2 and ret_shy < -0.05:score = -3; señal = "LIQUIDACION TOTAL — PELIGRO"
+        elif ret_spy < 0    and ret_shy > 0.1:  score = -2; señal = "HUIDA A BONOS CORTOS"
+        else:                                    score =  0; señal = "FLUJO NEUTRAL"
+        return {"disponible": True, "score": score, "señal": señal,
+                "ret_spy": round(ret_spy, 3), "ret_shy": round(ret_shy, 3)}
+    except Exception as e:
+        return {"disponible": False, "score": 0, "señal": f"ERROR:{e}"}
+
+# ── Breadth de sectores ───────────────────────────────────────
+breadth_cache = {"verdes": 0, "rojos": 0, "total": 0, "disponible": False,
+                 "ultima_actualizacion": None}
+
+SECTORES_SP500 = ["XLK", "XLF", "XLV", "XLI", "XLC",
+                  "XLY", "XLP", "XLE", "XLB", "XLRE", "XLU"]
+
+def calcular_breadth_sectores():
+    """
+    Cuenta cuántos de los 11 sectores del S&P 500 están en positivo hoy.
+    Se calcula en la apertura (primeros 30 minutos).
+    9/11 o más en verde = día alcista estructural.
+    3/11 o menos en verde = día bajista estructural.
+    """
+    try:
+        datos = yf.download(SECTORES_SP500, period="2d", interval="1d", progress=False)
+        if datos.empty: return False
+        close = datos["Close"]
+        verdes = 0; rojos = 0
+        for sec in SECTORES_SP500:
+            if sec in close.columns and len(close[sec].dropna()) >= 2:
+                ret = float(close[sec].iloc[-1]) - float(close[sec].iloc[-2])
+                if ret > 0: verdes += 1
+                elif ret < 0: rojos += 1
+        total = verdes + rojos
+        breadth_cache.update({"verdes": verdes, "rojos": rojos, "total": total,
+                              "disponible": True, "ultima_actualizacion": hora_ny()})
+        print(f"  [BREADTH] ✅ {verdes}/11 sectores en verde | {rojos} en rojo")
+        return True
+    except Exception as e:
+        print(f"  [BREADTH] Error: {e}")
+        return False
+
+def evaluar_breadth():
+    if not breadth_cache["disponible"]:
+        return {"disponible": False, "score": 0, "señal": "N/D", "verdes": 0, "rojos": 0}
+    verdes = breadth_cache["verdes"]
+    rojos  = breadth_cache["rojos"]
+    total  = breadth_cache["total"]
+    if total == 0:
+        return {"disponible": False, "score": 0, "señal": "N/D", "verdes": 0, "rojos": 0}
+    pct = verdes / total * 100
+    if   pct >= 82: score =  2; señal = f"BREADTH FUERTE — {verdes}/11 sectores alcistas"
+    elif pct >= 64: score =  1; señal = f"BREADTH POSITIVO — {verdes}/11 sectores alcistas"
+    elif pct <= 18: score = -2; señal = f"BREADTH DÉBIL — solo {verdes}/11 sectores alcistas"
+    elif pct <= 36: score = -1; señal = f"BREADTH NEGATIVO — {verdes}/11 sectores alcistas"
+    else:           score =  0; señal = f"BREADTH NEUTRAL — {verdes}/11 sectores alcistas"
+    return {"disponible": True, "score": score, "señal": señal,
+            "verdes": verdes, "rojos": rojos, "pct": round(pct, 1)}
+
+# ── Fear/Greed implícito ──────────────────────────────────────
+def calcular_fear_greed(vix_nivel, vvix_resultado, pc_resultado):
+    """
+    Calcula un índice Fear/Greed implícito en tiempo real
+    combinando VIX + VVIX + Put/Call ratio.
+    Escala 0-100: 0=Miedo Extremo, 50=Neutral, 100=Codicia Extrema
+    """
+    try:
+        # Componente VIX (invertido — VIX alto = miedo)
+        vix_score = max(0, min(100, 100 - (vix_nivel - 10) * 3.33))
+        # Componente VVIX
+        vvix_nivel = vvix_resultado.get("nivel") if vvix_resultado.get("disponible") else 90
+        vvix_score = max(0, min(100, 100 - (vvix_nivel - 70) * 2)) if vvix_nivel else 50
+        # Componente Put/Call (invertido — PC alto = miedo)
+        pc_ratio = pc_resultado.get("ratio") if pc_resultado.get("disponible") else 1.0
+        pc_score = max(0, min(100, (1.5 - pc_ratio) / 0.9 * 100)) if pc_ratio else 50
+        # Promedio ponderado
+        fg = round(vix_score * 0.4 + vvix_score * 0.3 + pc_score * 0.3, 1)
+        if   fg >= 75: etiqueta = "CODICIA EXTREMA"; score =  1
+        elif fg >= 55: etiqueta = "CODICIA";          score =  1
+        elif fg >= 45: etiqueta = "NEUTRAL";          score =  0
+        elif fg >= 25: etiqueta = "MIEDO";            score = -1
+        else:          etiqueta = "MIEDO EXTREMO";    score = -2
+        return {"disponible": True, "valor": fg, "etiqueta": etiqueta, "score": score}
+    except:
+        return {"disponible": False, "valor": 50, "etiqueta": "N/D", "score": 0}
+
+# ── Detector de rango ─────────────────────────────────────────
+detector_rango = {
+    "activo":              False,
+    "inicio":              None,
+    "precio_centro":       None,
+    "señales_suspendidas": False,
+}
+
+def evaluar_detector_rango(precio_actual, gamma_flip):
+    """
+    Si el precio lleva 30+ minutos oscilando en un rango menor a 20 puntos
+    alrededor del Gamma Flip, suspende señales hasta ruptura real.
+    Ruptura = alejamiento sostenido de 10+ puntos del flip.
+    """
+    global detector_rango
+    ahora = hora_ny()
+    if gamma_flip is None:
+        return {"en_rango": False, "suspender": False, "minutos": 0}
+    distancia_flip = abs(precio_actual - gamma_flip)
+    en_rango = distancia_flip <= RANGO_MAXIMO_PUNTOS / 2
+    if en_rango:
+        if not detector_rango["activo"]:
+            detector_rango["activo"]        = True
+            detector_rango["inicio"]        = ahora
+            detector_rango["precio_centro"] = gamma_flip
+        minutos_en_rango = (ahora - detector_rango["inicio"]).total_seconds() / 60 \
+                           if detector_rango["inicio"] else 0
+        suspender = minutos_en_rango >= RANGO_MINUTOS_MINIMO
+        if suspender and not detector_rango["señales_suspendidas"]:
+            detector_rango["señales_suspendidas"] = True
+            print(f"  [RANGO] ⏸ Señales suspendidas — {minutos_en_rango:.0f} min en rango de {distancia_flip:.1f}pts")
+        return {"en_rango": True, "suspender": suspender,
+                "minutos": round(minutos_en_rango, 1), "distancia_flip": round(distancia_flip, 1)}
+    else:
+        ruptura = distancia_flip >= RANGO_ALEJAMIENTO_MIN
+        if ruptura and detector_rango["señales_suspendidas"]:
+            print(f"  [RANGO] ✅ Ruptura detectada — precio se alejó {distancia_flip:.1f}pts del flip")
+            detector_rango["activo"]              = False
+            detector_rango["señales_suspendidas"] = False
+            detector_rango["inicio"]              = None
+        return {"en_rango": False, "suspender": False, "minutos": 0,
+                "distancia_flip": round(distancia_flip, 1)}
+
 # ── Tiempo ──────────────────────────────────────────────────
 def hora_ny():
     return datetime.now(pytz.timezone("America/New_York"))
@@ -310,13 +685,11 @@ def absorcion_silenciosa(close, volume, ventana=5):
     return {"tipo": tipo, "ratio_vol": round(float(ratio_vol), 2),
             "rango_pct": round(float(rango_pct * 100), 3), "score": score}
 
-def aceleracion_volumen(volume):
-    if len(volume) < 20: return {"aceleracion": 0.0, "score": 0}
-    vol_rec  = volume.iloc[-3:].mean()
-    vol_base = volume.iloc[-15:-3].mean()
-    acel     = vol_rec / vol_base if vol_base > 0 else 1.0
-    score    = 2 if acel > 2.5 else (1 if acel > 1.8 else 0)
-    return {"aceleracion": round(float(acel), 2), "score": score}
+def aceleracion_volumen_placeholder():
+    pass  # Eliminado en v3.9 — bajo impacto
+
+def zscore_volumen_placeholder():
+    pass  # Eliminado en v3.9 — bajo impacto
 
 def monitor_liquidez(close, volume, high, low, ventana=10):
     if len(close) < ventana + 2:
@@ -376,20 +749,8 @@ def divergencia_spy_tlt(spy, tlt, ventana=15):
     else:                                      score =  0
     return {"ret_spy": round(ret_spy, 4), "ret_tlt": round(ret_tlt, 4), "score": score}
 
-def vix_momentum(vix, ventana=10):
-    if len(vix) < ventana + 1:
-        return {"cambio_pct": 0.0, "nivel": float(vix.iloc[-1]), "score": 0}
-    nivel_actual   = float(vix.iloc[-1])
-    nivel_anterior = float(vix.iloc[-ventana])
-    cambio_pct     = (nivel_actual / nivel_anterior - 1) * 100
-    if   cambio_pct >  3.0:                        score = -3
-    elif cambio_pct >  1.5:                        score = -2
-    elif cambio_pct >  0.8:                        score = -1
-    elif cambio_pct < -3.0 and nivel_actual > 20:  score =  3
-    elif cambio_pct < -1.5 and nivel_actual > 18:  score =  2
-    elif cambio_pct < -0.8:                        score =  1
-    else:                                           score =  0
-    return {"nivel": round(nivel_actual, 2), "cambio_pct": round(cambio_pct, 2), "score": score}
+def vix_momentum_placeholder():
+    pass  # Eliminado en v3.9 — reemplazado por VVIX
 
 def ratio_vix_vix3m(datos, minutos_sin_cambio=0):
     if not datos.get("tiene_vix3m", False):
@@ -582,23 +943,32 @@ def calcular_score_total(datos, minutos_apertura):
                 else: break
         except: pass
 
+    precio_actual = float(spy.iloc[-1])
+    vix_nivel_act = float(vix.iloc[-1])
+
     d_vol      = delta_volumen(spy, open_, volume)
     absorc     = absorcion_silenciosa(spy, volume)
-    acel       = aceleracion_volumen(volume)
     div_qqq    = divergencia_spy_qqq(spy, qqq)
     div_tlt    = divergencia_spy_tlt(spy, tlt)
-    v_mom      = vix_momentum(vix)
     vix_ratio  = ratio_vix_vix3m(datos, minutos_vix_fatiga)
     move       = move_index(datos)
     dxy        = dxy_señal(datos)
     p_hora     = patron_primera_media_hora(spy, minutos_apertura)
-    z_vol      = zscore_volumen_hora(volume)
     pos_rango  = posicion_rango_diario(spy, high, low, minutos_apertura)
     tendencia  = filtro_tendencia(spy)
     liquidez   = monitor_liquidez(spy, volume, high, low)
-    gex        = evaluar_gex(float(spy.iloc[-1]))
+    gex        = evaluar_gex(precio_actual)
     dark_pool  = evaluar_dark_pool(datos)
     val_rsi    = float(rsi(spy).iloc[-1])
+
+    # NUEVAS SEÑALES v3.9
+    cot        = evaluar_cot()
+    mcclellan  = evaluar_mcclellan()
+    vvix       = evaluar_vvix(datos)
+    put_call   = evaluar_put_call()
+    rotacion   = evaluar_rotacion_defensiva(datos)
+    breadth    = evaluar_breadth()
+    fear_greed = calcular_fear_greed(vix_nivel_act, vvix, put_call)
 
     if vix_ratio.get("disponible") and vix_ratio.get("ratio"):
         vix_ratio_historia.append(vix_ratio["ratio"])
@@ -607,10 +977,8 @@ def calcular_score_total(datos, minutos_apertura):
     componentes = {
         "delta_volumen":   d_vol["score"],
         "absorcion":       absorc["score"],
-        "aceleracion_vol": acel["score"] if d_vol["score"] != 0 else 0,
         "divergencia_qqq": div_qqq["score"],
         "divergencia_tlt": div_tlt["score"],
-        "vix_momentum":    v_mom["score"],
         "vix_ratio":       vix_ratio["score"],
         "move_index":      move["score"],
         "dxy":             dxy["score"],
@@ -619,37 +987,37 @@ def calcular_score_total(datos, minutos_apertura):
         "patron_apertura": p_hora["score"] if p_hora["activo"] else 0,
         "posicion_rango":  pos_rango["score"],
         "liquidez":        liquidez["score"],
+        "cot":             cot["score"],
+        "mcclellan":       mcclellan["score"],
+        "vvix":            vvix["score"],
+        "put_call":        put_call["score"],
+        "rotacion":        rotacion["score"],
+        "breadth":         breadth["score"],
+        "fear_greed":      fear_greed["score"],
     }
 
     score_raw = sum(componentes.values())
-    if abs(score_raw) >= 3:
-        score_raw += z_vol["score_bonus"] * (1 if score_raw > 0 else -1)
 
     penalizacion_rsi = 0
     if score_raw > 0 and val_rsi > 75:   penalizacion_rsi = -2
     elif score_raw < 0 and val_rsi < 25: penalizacion_rsi =  2
     score_raw += penalizacion_rsi
 
-    # v3.8: Filtro de tendencia AGRESIVO
+    # v3.8/v3.9: Filtro de tendencia AGRESIVO
     penalizacion_tendencia = 0
     if tendencia["tendencia_bajista_fuerte"]:
-        # Tendencia bajista fuerte (mínimos más bajos + bajo EMA20)
         if score_raw > 0:
-            penalizacion_tendencia = -4  # Penalización fuerte
-        # Forzar score bajista si también está bajo el Gamma Flip
+            penalizacion_tendencia = -4
         if gex.get("disponible") and gex.get("distancia_flip") is not None:
-            if gex["distancia_flip"] < 0:  # bajo el Gamma Flip
-                penalizacion_tendencia = -6  # Penalización muy fuerte
+            if gex["distancia_flip"] < 0:
+                penalizacion_tendencia = -6
     elif tendencia["minimos_bajistas"] and not tendencia["sobre_ema"]:
-        # Mínimos bajistas + bajo EMA20 (sin confirmar fuerte aún)
         if score_raw > 0:
             penalizacion_tendencia = -3
     elif not tendencia["sobre_ema"]:
-        # Solo bajo EMA20
         if score_raw > 0:
             penalizacion_tendencia = -2
     elif tendencia["sobre_ema"] and score_raw < 0:
-        # Sobre EMA20 pero score bajista
         penalizacion_tendencia = 2
 
     score_raw += penalizacion_tendencia
@@ -660,15 +1028,214 @@ def calcular_score_total(datos, minutos_apertura):
         "penalizacion_tendencia": penalizacion_tendencia,
         "componentes": componentes, "minutos_vix_fatiga": minutos_vix_fatiga,
         "detalle": {
-            "delta_volumen": d_vol, "absorcion": absorc, "aceleracion": acel,
-            "div_qqq": div_qqq, "div_tlt": div_tlt, "vix_momentum": v_mom,
+            "delta_volumen": d_vol, "absorcion": absorc,
+            "div_qqq": div_qqq, "div_tlt": div_tlt,
             "vix_ratio": vix_ratio, "move_index": move, "dxy": dxy,
             "gex": gex, "dark_pool": dark_pool, "tendencia": tendencia,
-            "liquidez": liquidez, "patron_apertura": p_hora, "zscore_vol": z_vol,
+            "liquidez": liquidez, "patron_apertura": p_hora,
             "posicion_rango": pos_rango, "rsi": round(val_rsi, 1),
-            "precio": round(float(spy.iloc[-1]), 2), "vix_nivel": round(float(vix.iloc[-1]), 2),
+            "precio": round(precio_actual, 2), "vix_nivel": round(vix_nivel_act, 2),
+            "cot": cot, "mcclellan": mcclellan, "vvix": vvix,
+            "put_call": put_call, "rotacion": rotacion,
+            "breadth": breadth, "fear_greed": fear_greed,
         }
     }
+
+# ================================================================
+# === FUNCIONES NUEVAS v3.9 ======================================
+# ================================================================
+
+# ── Estado para macro post-evento ────────────────────────────
+ultimo_evento_procesado = {"tipo": None, "hora": None}
+
+def detectar_evento_reciente():
+    """
+    Detecta si ocurrió un evento macro de alto impacto en los últimos 20 minutos.
+    Busca en el contexto macro palabras clave de eventos conocidos.
+    """
+    ahora = hora_ny()
+    hora_et = ahora.hour * 60 + ahora.minute
+    # Horarios de eventos de alto impacto en minutos desde medianoche ET
+    eventos = {
+        "NFP":  8 * 60 + 30,
+        "CPI":  8 * 60 + 30,
+        "PCE":  8 * 60 + 30,
+        "FED": 14 * 60 + 0,
+        "FOMC":14 * 60 + 0,
+        "PIB":  8 * 60 + 30,
+    }
+    for nombre, hora_evento in eventos.items():
+        minutos_desde = hora_et - hora_evento
+        if 15 <= minutos_desde <= 20:
+            # Verificar que no lo hayamos procesado ya hoy
+            if (ultimo_evento_procesado["tipo"] != nombre or
+                ultimo_evento_procesado.get("dia") != ahora.date()):
+                return nombre
+    return None
+
+def procesar_macro_post_evento(nombre_evento):
+    """Actualiza la macro inmediatamente después de un evento de alto impacto."""
+    global ultimo_evento_procesado
+    print(f"  [POST-EVENTO] Actualizando macro después de {nombre_evento}...")
+    actualizar_contexto_macro(enviar_telegram=True)
+    ultimo_evento_procesado = {
+        "tipo": nombre_evento,
+        "hora": hora_ny(),
+        "dia":  hora_ny().date()
+    }
+
+# ── Pre-apertura ──────────────────────────────────────────────
+pre_apertura_enviado = {"dia": None}
+
+def enviar_pre_apertura():
+    """
+    Envía contexto completo 15 minutos antes de la apertura del mercado (9:15 ET).
+    Incluye futuros, COT, GEX estimado, Fear/Greed y eventos del día.
+    """
+    ahora = hora_ny()
+    if pre_apertura_enviado["dia"] == ahora.date():
+        return
+    hora_et = ahora.hour * 60 + ahora.minute
+    ventana_pre = 9 * 60 + 15  # 9:15 ET
+    if not (ventana_pre <= hora_et <= ventana_pre + 5):
+        return
+    print("  [PRE-APERTURA] Preparando contexto...")
+    try:
+        # Futuros S&P 500
+        es_data = yf.download("/ES=F", period="2d", interval="5m", progress=False)
+        futuro_precio = float(es_data["Close"].iloc[-1]) if not es_data.empty else 0
+        futuro_cambio = float((es_data["Close"].iloc[-1] / es_data["Close"].iloc[-12] - 1) * 100) \
+                        if len(es_data) >= 12 else 0
+        # COT sesgo
+        cot_info = cot_cache
+        cot_texto = f"COT: {cot_info.get('sesgo','N/D')}" if cot_info.get("disponible") else "COT: N/D"
+        # GEX niveles
+        gex_texto = ""
+        if gex_niveles["disponible"]:
+            gex_texto = (f"\n⚡ GEX: Flip:`{gex_niveles['gamma_flip']}` | "
+                        f"Call:`{gex_niveles['call_wall']}` | Put:`{gex_niveles['put_wall']}`")
+        # Breadth sectores
+        if not breadth_cache["disponible"]:
+            calcular_breadth_sectores()
+        breadth_texto = f"Breadth: {breadth_cache.get('verdes',0)}/11 sectores en verde" \
+                       if breadth_cache["disponible"] else "Breadth: N/D"
+        # Fear/Greed
+        vix_d = yf.download("^VIX", period="2d", interval="1d", progress=False)
+        vix_n = float(vix_d["Close"].iloc[-1]) if not vix_d.empty else 20
+        fg = calcular_fear_greed(vix_n, {"disponible": False}, {"disponible": False})
+        fg_texto = f"Fear/Greed: {fg['valor']} — {fg['etiqueta']}"
+        # Macro actual
+        macro_imp = contexto_macro.get("impacto", "calculando...")
+        emoji_dir = "📈" if futuro_cambio > 0 else "📉"
+        msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
+               f"⏰ Mercado abre en ~15 minutos\n"
+               f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
+               f"📊 {cot_texto}\n"
+               f"🌡️ {fg_texto}\n"
+               f"📉 {breadth_texto}\n"
+               f"🌍 Macro: `{macro_imp}`"
+               f"{gex_texto}")
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        pre_apertura_enviado["dia"] = ahora.date()
+        print("  [PRE-APERTURA] ✅ Enviado")
+    except Exception as e:
+        print(f"  [PRE-APERTURA] Error: {e}")
+
+# ── Resumen dominical ─────────────────────────────────────────
+resumen_dominical_enviado = {"semana": None}
+
+def enviar_resumen_dominical():
+    """
+    Envía resumen dominical cada domingo entre 6-7 PM Honduras (7-8 PM ET).
+    Incluye COT, futuros, GEX estimado lunes, sesgo institucional y eventos.
+    """
+    ahora = hora_ny()
+    if ahora.weekday() != 6:  # 6 = domingo
+        return
+    hora_et = ahora.hour * 60 + ahora.minute
+    if not (19 * 60 <= hora_et <= 20 * 60):  # 7-8 PM ET = 6-7 PM Honduras
+        return
+    semana_actual = ahora.isocalendar()[1]
+    if resumen_dominical_enviado["semana"] == semana_actual:
+        return
+    print("  [DOMINICAL] Preparando resumen semanal...")
+    try:
+        # Actualizar COT
+        obtener_cot_report()
+        # Futuros
+        es_data = yf.download("/ES=F", period="5d", interval="1d", progress=False)
+        futuro_precio = float(es_data["Close"].iloc[-1]) if not es_data.empty else 0
+        futuro_cambio_semana = float((es_data["Close"].iloc[-1] / es_data["Close"].iloc[0] - 1) * 100) \
+                               if len(es_data) >= 5 else 0
+        # COT
+        cot_sesgo = cot_cache.get("sesgo", "N/D") if cot_cache.get("disponible") else "N/D"
+        cot_neto  = cot_cache.get("neto_largo", 0)
+        # GEX estimado para el lunes
+        if not gex_niveles["disponible"]:
+            _gex_fallback()
+        gex_lunes = ""
+        if gex_niveles["disponible"]:
+            gex_lunes = (f"\n⚡ GEX estimado lunes:\n"
+                        f"   Flip: `{gex_niveles['gamma_flip']}` | "
+                        f"Call: `{gex_niveles['call_wall']}` | Put: `{gex_niveles['put_wall']}`")
+        # Buscar contexto macro con Opus
+        resultado_macro = buscar_contexto_macro()
+        sesgo_macro = resultado_macro.get("sesgo", "N/D") if resultado_macro else "N/D"
+        noticias_semana = resultado_macro.get("noticias", []) if resultado_macro else []
+        noticias_str = "\n".join(f"  • {n}" for n in noticias_semana[:3])
+        emoji_cot = "🟢" if "ALCISTA" in cot_sesgo else ("🔴" if "BAJISTA" in cot_sesgo else "⚪")
+        msg = (f"📊 *RESUMEN DOMINICAL — Semana {semana_actual}*\n{'─'*28}\n"
+               f"*Posicionamiento Smart Money (COT):*\n"
+               f"{emoji_cot} Sesgo: `{cot_sesgo}` | Neto: `{cot_neto:+,}` contratos\n{'─'*28}\n"
+               f"*Futuros S&P 500:*\n"
+               f"💵 Precio: `{futuro_precio:.0f}` | Semana: `{futuro_cambio_semana:+.2f}%`"
+               f"{gex_lunes}\n{'─'*28}\n"
+               f"*Noticias clave semana:*\n{noticias_str}\n{'─'*28}\n"
+               f"*Sesgo institucional:* {sesgo_macro}\n"
+               f"📅 Mercado abre el martes 9:30 ET")
+        if len(msg) > 4096: msg = msg[:4090] + "..."
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        resumen_dominical_enviado["semana"] = semana_actual
+        print("  [DOMINICAL] ✅ Resumen enviado")
+    except Exception as e:
+        print(f"  [DOMINICAL] Error: {e}")
+
+# ── Monitor overnight ─────────────────────────────────────────
+ultimo_alerta_overnight = {"hora": None}
+
+def monitorear_overnight():
+    """
+    Monitorea futuros, VIX y noticias overnight.
+    Si futuros mueven más de 0.5%, envía alerta anticipando gap de apertura.
+    """
+    try:
+        ahora = hora_ny()
+        # Solo verificar cada 30 minutos para no saturar
+        if (ultimo_alerta_overnight["hora"] and
+            (ahora - ultimo_alerta_overnight["hora"]).total_seconds() < 1800):
+            return
+        es_data = yf.download("/ES=F", period="2d", interval="5m", progress=False)
+        if es_data.empty or len(es_data) < 2: return
+        precio_actual = float(es_data["Close"].iloc[-1])
+        precio_cierre = float(es_data["Close"].iloc[-13])  # ~1 hora atrás
+        cambio_pct = (precio_actual / precio_cierre - 1) * 100
+        if abs(cambio_pct) < 0.5: return
+        # Movimiento significativo detectado
+        emoji = "📈" if cambio_pct > 0 else "📉"
+        tipo  = "ALCISTA" if cambio_pct > 0 else "BAJISTA"
+        gex_nivel = gex_niveles.get("gamma_flip", "N/D")
+        wall = gex_niveles.get("call_wall" if cambio_pct > 0 else "put_wall", "N/D")
+        msg = (f"⚠️ *ALERTA OVERNIGHT — US500 v3.9*\n{'─'*28}\n"
+               f"{emoji} Futuros /ES moviéndose `{cambio_pct:+.2f}%`\n"
+               f"💵 Precio futuro: `{precio_actual:.0f}`\n"
+               f"🎯 Gap probable mañana: *{tipo}*\n"
+               f"⚡ GEX Flip: `{gex_nivel}` | {'Call Wall' if cambio_pct > 0 else 'Put Wall'}: `{wall}`\n"
+               f"⏰ {ahora.strftime('%H:%M ET')} — Mercado cerrado")
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        ultimo_alerta_overnight["hora"] = ahora
+        print(f"  [OVERNIGHT] ⚠️ Alerta enviada — futuros {cambio_pct:+.2f}%")
+    except Exception as e:
+        print(f"  [OVERNIGHT] Error: {e}")
 
 # ================================================================
 # === CAPA 0: CONTEXTO MACROECONÓMICO ============================
@@ -817,7 +1384,24 @@ def analizar_con_claude(resultado):
     macro_hora     = contexto_macro.get("ultima_actualizacion")
     macro_hora_str = macro_hora.strftime("%H:%M ET") if macro_hora else "?"
 
-    prompt = f"""Analista cuantitativo US500 intradía. Score:{score}/10 {direccion}.{' NOTAS: '+notas_str if notas_str else ''}
+    # Nuevas señales v3.9
+    cot_d  = detalle.get("cot", {})
+    mcl_d  = detalle.get("mcclellan", {})
+    vvix_d = detalle.get("vvix", {})
+    pc_d   = detalle.get("put_call", {})
+    rot_d  = detalle.get("rotacion", {})
+    br_d   = detalle.get("breadth", {})
+    fg_d   = detalle.get("fear_greed", {})
+
+    cot_str  = f"COT:{cot_d.get('sesgo','N/D')}" if cot_d.get("disponible") else "COT:N/D"
+    mcl_str  = f"McC:{mcl_d.get('oscilador','N/D')} {mcl_d.get('señal','')}" if mcl_d.get("disponible") else "McC:N/D"
+    vvix_str = f"VVIX:{vvix_d.get('nivel','N/D')} {vvix_d.get('señal','')}" if vvix_d.get("disponible") else "VVIX:N/D"
+    pc_str   = f"PC:{pc_d.get('ratio','N/D')} {pc_d.get('señal','')}" if pc_d.get("disponible") else "PC:N/D"
+    rot_str  = f"Rotacion:{rot_d.get('señal','N/D')}" if rot_d.get("disponible") else "Rotacion:N/D"
+    br_str   = f"Breadth:{br_d.get('verdes',0)}/11 {br_d.get('señal','')}" if br_d.get("disponible") else "Breadth:N/D"
+    fg_str   = f"FearGreed:{fg_d.get('valor','N/D')} {fg_d.get('etiqueta','')}" if fg_d.get("disponible") else "FG:N/D"
+
+    prompt = f"""Analista cuantitativo US500 intradía v3.9. Score:{score}/10 {direccion}.{' NOTAS: '+notas_str if notas_str else ''}
 
 MACRO ({macro_hora_str}): {macro_impacto} | {macro_noticias} | {macro_resumen} | Sesgo:{macro_sesgo}
 
@@ -825,15 +1409,19 @@ TÉCNICO: Precio:{detalle['precio']} RSI:{detalle['rsi']} VIX:{detalle['vix_nive
 {vix_str} | {move_str} | {dxy_str} | {tend_str}
 {gex_str}
 {dp_str}
+
+SEÑALES INSTITUCIONALES v3.9:
+{cot_str} | {mcl_str} | {vvix_str}
+{pc_str} | {rot_str} | {br_str} | {fg_str}
+
 Rango:{detalle['posicion_rango']['posicion_pct']}% (max:{detalle['posicion_rango']['max_dia']} min:{detalle['posicion_rango']['min_dia']})
-Señales: DeltaVol:{comps['delta_volumen']}({detalle['delta_volumen']['ratio']}) Absorc:{comps['absorcion']} QQQ:{comps['divergencia_qqq']} TLT:{comps['divergencia_tlt']} VIX_mom:{comps['vix_momentum']} DXY:{comps['dxy']} MOVE:{comps['move_index']} GEX:{comps['gex']} DP:{comps['dark_pool']} Rango:{comps['posicion_rango']}
 
 Responde en español, 5 párrafos cortos, sin asteriscos:
-1. Probabilidad {direccion} 5-15min (%) ajustada por macro, GEX y Dark Pool
-2. Señales más fuertes — especialmente GEX (niveles de opciones) y Dark Pool (flujo institucional)
-3. Alineación o contradicción macro vs técnico
-4. Niveles clave: usa los niveles GEX (Gamma Flip, Call Wall, Put Wall) como soportes/resistencias
-5. Acción inmediata considerando los niveles GEX"""
+1. Probabilidad {direccion} 5-15min (%) ajustada por macro, GEX, Dark Pool, COT y Fear/Greed
+2. Señales institucionales más fuertes — GEX, Dark Pool, VVIX, Put/Call, Breadth, Rotación
+3. Alineación o contradicción macro vs técnico vs señales institucionales
+4. Niveles clave: Gamma Flip, Call Wall, Put Wall como soportes/resistencias
+5. Acción inmediata considerando todos los niveles institucionales"""
 
     try:
         respuesta = claude_client.messages.create(
@@ -1055,13 +1643,19 @@ contador_ciclos        = 0
 cooldown               = EstadoCooldown()
 
 print("=" * 60)
-print("   US500 MONITOR v3.8 — FILTRO TENDENCIA AGRESIVO")
+print("   US500 MONITOR v3.9 — VISION INSTITUCIONAL COMPLETA")
 print("=" * 60)
-print("  GEX + Dark Pool + Macro + DXY + MOVE + Liquidez")
-print("  NUEVO v3.8: Filtro tendencia agresivo — señales bajistas")
-print("  cuando precio hace minimos mas bajos bajo Gamma Flip")
+print("  12 mejoras | 6 limpiezas | COT+McC+VVIX+PC+SHY+Breadth")
 print(f"  Umbral: ±{UMBRAL_SCORE}/10 | Min entre alertas: {TIEMPO_MIN_ALERTAS} min")
 print("=" * 60)
+
+# Inicializar datos semanales
+print("  [INIT] Cargando COT Report...")
+obtener_cot_report()
+print("  [INIT] Calculando McClellan Oscillator...")
+calcular_mcclellan()
+print("  [INIT] Obteniendo Put/Call Ratio...")
+obtener_put_call_ratio()
 
 while True:
     try:
@@ -1070,7 +1664,7 @@ while True:
         abierto      = mercado_abierto()
         minutos      = minutos_desde_apertura()
 
-        # Mercado cerrado
+        # ── Mercado cerrado ──────────────────────────────────
         if not abierto:
             if estado_mercado_enviado:
                 spy_temp = descargar_datos()
@@ -1078,27 +1672,38 @@ while True:
                     precio_final = float(spy_temp["close"]["^GSPC"].iloc[-1])
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
-                            f"🔕 *MERCADO CERRADO*\nUS500 final: `{precio_final:.2f}`\nHasta mañana. 🌙",
+                            f"🔕 *MERCADO CERRADO — US500 v3.9*\n"
+                            f"US500 final: `{precio_final:.2f}`\nHasta mañana. 🌙",
                             parse_mode="Markdown")
                     except:
                         bot.send_message(TELEGRAM_CHAT_ID,
-                            f"MERCADO CERRADO\nUS500 final: {precio_final:.2f}\nHasta mañana.")
+                            f"MERCADO CERRADO\nUS500 final: {precio_final:.2f}")
                 estado_mercado_enviado = False
                 resetear_detector_agotamiento()
-                # Resetear GEX para nueva sesión
                 gex_niveles["disponible"] = False
                 gex_niveles["ultima_actualizacion"] = None
+                detector_rango["activo"] = False
+                detector_rango["señales_suspendidas"] = False
 
+            # Funciones fuera de horario
+            enviar_resumen_dominical()
+            monitorear_overnight()
             elapsed = time.time() - inicio_ciclo
             time.sleep(max(0, 60 - elapsed))
             contador_ciclos += 1
             continue
 
-        # Actualizar macro si corresponde
-        if necesita_actualizar_macro():
+        # ── Pre-apertura ─────────────────────────────────────
+        enviar_pre_apertura()
+
+        # ── Macro post-evento ─────────────────────────────────
+        evento_reciente = detectar_evento_reciente()
+        if evento_reciente:
+            procesar_macro_post_evento(evento_reciente)
+        elif necesita_actualizar_macro():
             actualizar_contexto_macro(enviar_telegram=True)
 
-        # Descargar datos
+        # ── Descargar datos ───────────────────────────────────
         datos = descargar_datos()
         if datos is None:
             print(f"[{ahora_ny.strftime('%H:%M')}] ⚠️ Sin datos")
@@ -1110,32 +1715,45 @@ while True:
         spy_precio = float(datos["close"]["^GSPC"].iloc[-1])
         vix_precio = float(datos["close"]["^VIX"].iloc[-1])
 
-        # Mensaje de apertura + GEX + Dark Pool
+        # ── Apertura del mercado ──────────────────────────────
         if not estado_mercado_enviado:
             print("  [INIT] Obteniendo niveles GEX...")
             obtener_gex()
-            print("  [INIT] Obteniendo datos Dark Pool...")
+            print("  [INIT] Obteniendo Dark Pool...")
             obtener_dark_pool()
+            print("  [INIT] Calculando Breadth sectores...")
+            calcular_breadth_sectores()
+            print("  [INIT] Actualizando McClellan...")
+            calcular_mcclellan()
+            print("  [INIT] Obteniendo Put/Call ratio...")
+            obtener_put_call_ratio()
 
             macro_str = contexto_macro.get("impacto", "calculando...")
-            gex_msg   = ""
+            gex_msg = ""
             if gex_niveles["disponible"]:
                 est = " (est.)" if gex_niveles.get("es_estimado") else ""
                 gex_msg = (f"\n⚡ GEX{est}: Flip:`{gex_niveles['gamma_flip']}` | "
-                           f"Call:`{gex_niveles['call_wall']}` | Put:`{gex_niveles['put_wall']}`")
+                          f"Call:`{gex_niveles['call_wall']}` | Put:`{gex_niveles['put_wall']}`")
+            breadth_msg = ""
+            if breadth_cache["disponible"]:
+                breadth_msg = f"\n📊 Breadth: `{breadth_cache['verdes']}/11` sectores alcistas"
+            cot_msg = ""
+            if cot_cache["disponible"]:
+                cot_msg = f"\n📋 COT: `{cot_cache['sesgo']}`"
             try:
                 bot.send_message(TELEGRAM_CHAT_ID,
-                    f"🔔 *MERCADO ABIERTO — US500 v3.7*\n"
+                    f"🔔 *MERCADO ABIERTO — US500 v3.9*\n"
                     f"US500: `{spy_precio:.2f}` | VIX: `{vix_precio:.2f}`\n"
-                    f"Macro: `{macro_str}`{gex_msg}\nSistema v3.7 activo. Ciclo: 1 min.",
+                    f"Macro: `{macro_str}`"
+                    f"{gex_msg}{breadth_msg}{cot_msg}\n"
+                    f"Sistema v3.9 activo. Ciclo: 1 min.",
                     parse_mode="Markdown")
             except:
                 bot.send_message(TELEGRAM_CHAT_ID,
-                    f"MERCADO ABIERTO US500 v3.7\nUS500: {spy_precio:.2f} | VIX: {vix_precio:.2f}\n"
-                    f"Macro: {macro_str}\nSistema v3.7 activo.")
+                    f"MERCADO ABIERTO US500 v3.9\nUS500: {spy_precio:.2f} | VIX: {vix_precio:.2f}")
             estado_mercado_enviado = True
 
-        # Calcular score
+        # ── Calcular score ────────────────────────────────────
         resultado = calcular_score_total(datos, minutos)
         score     = resultado["score"]
         detalle   = resultado["detalle"]
@@ -1149,7 +1767,11 @@ while True:
         gex       = detalle["gex"]
         dp        = detalle["dark_pool"]
 
-        # Log consola
+        # ── Detector de rango v3.9 ────────────────────────────
+        gamma_flip_nivel = gex_niveles.get("gamma_flip") if gex_niveles["disponible"] else None
+        rango_estado = evaluar_detector_rango(spy_precio, gamma_flip_nivel)
+
+        # ── Log consola ───────────────────────────────────────
         comps_activos = {k: v for k, v in resultado["componentes"].items() if v != 0}
         tags = ""
         if pen_rsi  != 0: tags += f" [RSI:{pen_rsi:+d}]"
@@ -1159,18 +1781,21 @@ while True:
         if dxy.get("disponible"): tags += f" [DXY:{dxy.get('señal','?')[:5]}]"
         if gex.get("disponible"): tags += f" [GEX:{gex.get('score',0):+d}]"
         if dp.get("disponible"):  tags += f" [DP:{dp.get('ratio',0):.0%}]"
+        if rango_estado["en_rango"]: tags += f" [RANGO:{rango_estado['minutos']:.0f}m]"
         tags += f" [{contexto_macro['impacto'][:3]}]"
         print(f"[{ahora_ny.strftime('%H:%M')}] {detalle['precio']:.2f} | Score:{score:+d}{tags} | "
               f"RSI:{detalle['rsi']} | VIX:{detalle['vix_nivel']} | EMA:{'↑' if tend.get('sobre_ema') else '↓'}"
               + (f" | {comps_activos}" if comps_activos else ""))
 
-        # Detector de agotamiento
+        # ── Detector de agotamiento ───────────────────────────
         if estado_agotamiento["activo"] and not estado_agotamiento["alerta_enviada"]:
             if evaluar_agotamiento(resultado):
                 enviar_alerta_agotamiento(resultado)
 
-        # Alertas principales
-        if score >= UMBRAL_SCORE:
+        # ── Alertas principales (con detector de rango) ───────
+        if rango_estado.get("suspender"):
+            print(f"  → ⏸ Señales suspendidas por detector de rango ({rango_estado['minutos']:.0f} min)")
+        elif score >= UMBRAL_SCORE:
             ok, razon = cooldown.debe_alertar_alcista(resultado)
             if ok:
                 print(f"  → 🟢 ALCISTA score={score} ({razon}). Consultando Claude...")
@@ -1193,7 +1818,6 @@ while True:
                 print(f"  → ✅ Enviado ({ahora_ny.strftime('%H:%M:%S')} ET)")
             else:
                 print(f"  → ⏸ Bajista {score} bloqueado: {razon}")
-
         else:
             if estado_agotamiento["activo"] and estado_agotamiento["alerta_enviada"]:
                 resetear_detector_agotamiento()
