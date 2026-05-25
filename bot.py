@@ -592,9 +592,48 @@ def evaluar_detector_rango(precio_actual, gamma_flip):
 def hora_ny():
     return datetime.now(pytz.timezone("America/New_York"))
 
+# Días festivos NYSE 2025-2027 (año, mes, día)
+NYSE_FESTIVOS = {
+    # 2025
+    (2025, 1,  1),  # Año Nuevo
+    (2025, 1, 20),  # MLK Day
+    (2025, 2, 17),  # Presidents Day
+    (2025, 4, 18),  # Good Friday
+    (2025, 5, 26),  # Memorial Day
+    (2025, 6, 19),  # Juneteenth
+    (2025, 7,  4),  # Independence Day
+    (2025, 9,  1),  # Labor Day
+    (2025,11, 27),  # Thanksgiving
+    (2025,12, 25),  # Navidad
+    # 2026
+    (2026, 1,  1),  # Año Nuevo
+    (2026, 1, 19),  # MLK Day
+    (2026, 2, 16),  # Presidents Day
+    (2026, 4,  3),  # Good Friday
+    (2026, 5, 25),  # Memorial Day ← HOY
+    (2026, 6, 19),  # Juneteenth
+    (2026, 7,  3),  # Independence Day (observado)
+    (2026, 9,  7),  # Labor Day
+    (2026,11, 26),  # Thanksgiving
+    (2026,12, 25),  # Navidad
+    # 2027
+    (2027, 1,  1),  # Año Nuevo
+    (2027, 1, 18),  # MLK Day
+    (2027, 2, 15),  # Presidents Day
+    (2027, 3, 26),  # Good Friday
+    (2027, 5, 31),  # Memorial Day
+    (2027, 6, 18),  # Juneteenth (observado)
+    (2027, 7,  5),  # Independence Day (observado)
+    (2027, 9,  6),  # Labor Day
+    (2027,11, 25),  # Thanksgiving
+    (2027,12, 24),  # Navidad (observado)
+}
+
 def mercado_abierto():
     ahora = hora_ny()
     if ahora.weekday() > 4: return False
+    # Verificar festivos NYSE
+    if (ahora.year, ahora.month, ahora.day) in NYSE_FESTIVOS: return False
     apertura = ahora.replace(hour=9,  minute=30, second=0, microsecond=0)
     cierre   = ahora.replace(hour=16, minute=0,  second=0, microsecond=0)
     return apertura <= ahora <= cierre
