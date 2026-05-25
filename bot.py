@@ -1146,14 +1146,16 @@ resumen_dominical_enviado = {"semana": None}
 
 def enviar_resumen_dominical():
     """
-    Envía resumen dominical cada domingo entre 6-7 PM Honduras (7-8 PM ET).
-    Incluye COT, futuros, GEX estimado lunes, sesgo institucional y eventos.
+    Envía resumen dominical cada domingo entre 6-8 PM Honduras (8-10 PM ET).
+    Honduras = UTC-6 | ET verano = UTC-4 → diferencia de 2 horas.
+    Ventana amplia para no depender del ciclo exacto de 60 segundos.
     """
     ahora = hora_ny()
     if ahora.weekday() != 6:  # 6 = domingo
         return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (19 * 60 <= hora_et <= 20 * 60):  # 7-8 PM ET = 6-7 PM Honduras
+    # 8-10 PM ET = 6-8 PM Honduras (ventana amplia de 2 horas)
+    if not (20 * 60 <= hora_et <= 22 * 60):
         return
     semana_actual = ahora.isocalendar()[1]
     if resumen_dominical_enviado["semana"] == semana_actual:
