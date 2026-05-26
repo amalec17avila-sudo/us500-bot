@@ -1060,11 +1060,37 @@ def calcular_score_total(datos, minutos_apertura):
         penalizacion_tendencia = 2
 
     score_raw += penalizacion_tendencia
+
+    # v3.9: Filtro de agotamiento de rally/caída diario
+    # Si el precio ya subió 30+ puntos desde el mínimo del día → penaliza señales alcistas
+    # Si el precio ya cayó 30+ puntos desde el máximo del día → penaliza señales bajistas
+    penalizacion_rally = 0
+    try:
+        min_dia = float(low.iloc[-minutos_apertura:].min()) if minutos_apertura > 0 else float(low.iloc[-30:].min())
+        max_dia = float(high.iloc[-minutos_apertura:].max()) if minutos_apertura > 0 else float(high.iloc[-30:].max())
+        distancia_desde_minimo = precio_actual - min_dia
+        distancia_desde_maximo = max_dia - precio_actual
+        if score_raw > 0 and distancia_desde_minimo > 50:
+            penalizacion_rally = -3
+            print(f"  [RALLY] ⚠️ Precio subió {distancia_desde_minimo:.1f}pts desde mínimo — penalización -3")
+        elif score_raw > 0 and distancia_desde_minimo > 30:
+            penalizacion_rally = -2
+            print(f"  [RALLY] ⚠️ Precio subió {distancia_desde_minimo:.1f}pts desde mínimo — penalización -2")
+        elif score_raw < 0 and distancia_desde_maximo > 50:
+            penalizacion_rally = 3
+            print(f"  [RALLY] ⚠️ Precio cayó {distancia_desde_maximo:.1f}pts desde máximo — penalización +3")
+        elif score_raw < 0 and distancia_desde_maximo > 30:
+            penalizacion_rally = 2
+            print(f"  [RALLY] ⚠️ Precio cayó {distancia_desde_maximo:.1f}pts desde máximo — penalización +2")
+    except:
+        pass
+    score_raw += penalizacion_rally
     score_final = max(-10, min(10, score_raw))
 
     return {
         "score": score_final, "penalizacion_rsi": penalizacion_rsi,
         "penalizacion_tendencia": penalizacion_tendencia,
+        "penalizacion_rally": penalizacion_rally,
         "componentes": componentes, "minutos_vix_fatiga": minutos_vix_fatiga,
         "detalle": {
             "delta_volumen": d_vol, "absorcion": absorc,
@@ -1135,8 +1161,8 @@ def enviar_pre_apertura():
     if pre_apertura_enviado["dia"] == ahora.date():
         return
     hora_et = ahora.hour * 60 + ahora.minute
-    ventana_pre = 9 * 60 + 15  # 9:15 ET
-    if not (ventana_pre <= hora_et <= ventana_pre + 5):
+    # Ventana amplia 9:00-9:15 ET para no depender del ciclo exacto de 60s
+    if not (9 * 60 <= hora_et <= 9 * 60 + 15):
         return
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
@@ -1780,7 +1806,10 @@ while True:
                 breadth_msg = f"\n📊 Breadth: `{breadth_cache['verdes']}/11` sectores alcistas"
             cot_msg = ""
             if cot_cache["disponible"]:
-                cot_msg = f"\n📋 COT: `{cot_cache['sesgo']}`"
+                sesgo_cot = cot_cache['sesgo']
+                neto_cot  = cot_cache.get('neto_largo', 0)
+                emoji_cot = "🟢" if "ALCISTA" in sesgo_cot else ("🔴" if "BAJISTA" in sesgo_cot else "⚪")
+                cot_msg = f"\n{emoji_cot} COT Smart Money: `{sesgo_cot}` ({neto_cot:+,} contratos est.)"
             try:
                 bot.send_message(TELEGRAM_CHAT_ID,
                     f"🔔 *MERCADO ABIERTO — US500 v3.9*\n"
