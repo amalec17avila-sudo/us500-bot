@@ -1395,12 +1395,12 @@ def _enviar_macro_telegram(resultado):
 
 def necesita_actualizar_macro():
     if contexto_macro["ultima_actualizacion"] is None: return True
-    ahora     = hora_ny()
-    ultima    = contexto_macro["ultima_actualizacion"]
+    ahora      = hora_ny()
+    ultima     = contexto_macro["ultima_actualizacion"]
     mins_desde = (ahora - ultima).total_seconds() / 60
+    # Cooldown mínimo de 30 minutos entre cualquier actualización macro
+    # Evita spam de 6 mensajes consecutivos como ocurrió el 27/mayo
     if mins_desde < 30: return False
-    if evento_acaba_de_ocurrir() and mins_desde >= 5:
-        print("  [MACRO] Evento detectado — actualizando inmediatamente"); return True
     hora_actual = ahora.hour * 60 + ahora.minute
     apertura    = 9 * 60 + 30
     mediodia    = 12 * 60 + 30
@@ -1861,6 +1861,20 @@ while True:
         if estado_agotamiento["activo"] and not estado_agotamiento["alerta_enviada"]:
             if evaluar_agotamiento(resultado):
                 enviar_alerta_agotamiento(resultado)
+
+        # ── Regla de apertura v3.9 ────────────────────────────
+        # 0-5 min: bloqueo total — datos insuficientes y RSI irreal
+        # 5-30 min: penalización -2 por liquidez baja de apertura
+        # 30+ min: señales normales
+        if minutos < 5:
+            print(f"  → ⏸ Bloqueo apertura ({minutos:.0f} min < 5) — solo mensaje apertura")
+            contador_ciclos += 1
+            elapsed = time.time() - inicio_ciclo
+            time.sleep(max(0, 60 - elapsed))
+            continue
+        elif minutos < 30:
+            score = max(-10, min(10, score - 2 if score > 0 else score + 2))
+            print(f"  → ⚠️ Apertura temprana ({minutos:.0f} min) — score ajustado a {score}")
 
         # ── Alertas principales (con detector de rango) ───────
         if rango_estado.get("suspender"):
