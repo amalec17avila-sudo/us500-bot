@@ -62,7 +62,7 @@ claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 # ── Modelos ──────────────────────────────────────────────────
 MODELO_SEÑALES = "claude-haiku-4-5-20251001"
-MODELO_MACRO   = "claude-opus-4-5"
+MODELO_MACRO   = "claude-sonnet-4-5"
 
 # ── Configuración ────────────────────────────────────────────
 UMBRAL_SCORE             = 7
@@ -1483,12 +1483,12 @@ SEÑALES INSTITUCIONALES v3.9:
 
 Rango:{detalle['posicion_rango']['posicion_pct']}% (max:{detalle['posicion_rango']['max_dia']} min:{detalle['posicion_rango']['min_dia']})
 
-Responde en español, 5 párrafos cortos, sin asteriscos:
-1. Probabilidad {direccion} 5-15min (%) ajustada por macro, GEX, Dark Pool, COT y Fear/Greed
-2. Señales institucionales más fuertes — GEX, Dark Pool, VVIX, Put/Call, Breadth, Rotación
-3. Alineación o contradicción macro vs técnico vs señales institucionales
-4. Niveles clave: Gamma Flip, Call Wall, Put Wall como soportes/resistencias
-5. Acción inmediata considerando todos los niveles institucionales"""
+Responde en español en EXACTAMENTE 5 líneas cortas, sin asteriscos, sin títulos:
+1. Probabilidad {direccion} 5-15min: XX% — razón principal en 5 palabras
+2. Señal más fuerte: [nombre] — qué dice en 5 palabras
+3. Macro vs institucional: alineados o contradicción en 5 palabras
+4. Niveles: Flip:{gex_str.split('Flip:')[1].split('|')[0].strip() if 'Flip:' in gex_str else 'N/D'} | Stop recomendado | Target recomendado
+5. Acción: una frase corta y directa"""
 
     try:
         respuesta = claude_client.messages.create(
@@ -1508,6 +1508,63 @@ Responde en español, 5 párrafos cortos, sin asteriscos:
                 return respuesta.content[0].text
             except Exception as e2: return f"[Error Claude: {e2}]"
         return f"[Error Claude: {e}]"
+
+# ── Alerta de Contradicción Institucional ────────────────────
+def detectar_contradiccion_institucional(resultado):
+    """
+    Detecta cuando el macro dice bajista pero los institucionales
+    están comprando — señal de movimiento encubierto inminente.
+    """
+    detalle    = resultado["detalle"]
+    macro_imp  = contexto_macro.get("impacto", "")
+    dp         = detalle.get("dark_pool", {})
+    vix_nivel  = detalle.get("vix_nivel", 20)
+    fg         = detalle.get("fear_greed", {})
+    vvix       = detalle.get("vvix", {})
+    pc         = detalle.get("put_call", {})
+
+    macro_bajista   = "BAJISTA" in macro_imp.upper()
+    dp_acumulando   = dp.get("interpretacion", "") == "ACUMULACION INSTITUCIONAL OCULTA"
+    vix_bajo        = vix_nivel < 18
+    fg_codicia      = fg.get("valor", 50) > 60 if fg.get("disponible") else False
+    vvix_bajo       = vvix.get("score", 0) >= 0 if vvix.get("disponible") else True
+    pc_neutro       = pc.get("ratio", 1.0) < 1.1 if pc.get("disponible") else True
+
+    # Contradicción fuerte: macro bajista + 4 señales institucionales alcistas
+    señales_alcistas = sum([dp_acumulando, vix_bajo, fg_codicia, vvix_bajo, pc_neutro])
+    return macro_bajista and señales_alcistas >= 4
+
+def enviar_alerta_contradiccion(resultado):
+    """Envía alerta especial de contradicción institucional."""
+    detalle   = resultado["detalle"]
+    precio    = detalle["precio"]
+    gex       = detalle.get("gex", {})
+    flip      = gex.get("gamma_flip", gex_niveles.get("gamma_flip", "N/D"))
+    call_wall = gex_niveles.get("call_wall", "N/D")
+    vix_nivel = detalle.get("vix_nivel", "N/D")
+    dp        = detalle.get("dark_pool", {})
+    fg        = detalle.get("fear_greed", {})
+    fg_val    = fg.get("valor", "N/D") if fg.get("disponible") else "N/D"
+
+    msg = (f"⚡ *CONTRADICCIÓN INSTITUCIONAL DETECTADA*\n{'─'*30}\n"
+           f"💵 Precio: `{precio}`\n"
+           f"🌍 Macro: `BAJISTA` — pero institucionales COMPRANDO\n"
+           f"{'─'*30}\n"
+           f"🏦 Dark Pool: `ACUMULACIÓN {dp.get('ratio', 0):.1%}`\n"
+           f"📉 VIX: `{vix_nivel}` — bajo, sin pánico\n"
+           f"🌡️ Fear/Greed: `{fg_val}` — codicia\n"
+           f"{'─'*30}\n"
+           f"⚡ GEX Flip: `{flip}` | Call Wall: `{call_wall}`\n"
+           f"⚠️ *Los institucionales ignoran el ruido macro.*\n"
+           f"📈 Posible movimiento alcista encubierto.")
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        print("  [CONTRADICCIÓN] ⚡ Alerta enviada")
+    except Exception as e:
+        print(f"  [CONTRADICCIÓN] Error: {e}")
+
+# Estado para no repetir la alerta de contradicción
+contradiccion_cache = {"enviada": False, "dia": None}
 
 # ── Telegram ─────────────────────────────────────────────────
 def barra_score(score):
@@ -1861,6 +1918,15 @@ while True:
         if estado_agotamiento["activo"] and not estado_agotamiento["alerta_enviada"]:
             if evaluar_agotamiento(resultado):
                 enviar_alerta_agotamiento(resultado)
+
+        # ── Alerta de contradicción institucional ─────────────
+        ahora_dia = ahora_ny.date()
+        if contradiccion_cache["dia"] != ahora_dia:
+            contradiccion_cache["enviada"] = False
+            contradiccion_cache["dia"]     = ahora_dia
+        if not contradiccion_cache["enviada"] and detectar_contradiccion_institucional(resultado):
+            enviar_alerta_contradiccion(resultado)
+            contradiccion_cache["enviada"] = True
 
         # ── Regla de apertura v3.9 ────────────────────────────
         # 0-5 min: bloqueo total — datos insuficientes y RSI irreal
