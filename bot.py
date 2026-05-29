@@ -1154,15 +1154,16 @@ pre_apertura_enviado = {"dia": None}
 
 def enviar_pre_apertura():
     """
-    Envía contexto completo 15 minutos antes de la apertura del mercado (9:15 ET).
-    Incluye futuros, COT, GEX estimado, Fear/Greed y eventos del día.
+    Envía contexto completo antes de la apertura del mercado.
+    Ventana: 9:00-9:45 ET (7:00-7:45 AM Honduras) para no depender del ciclo exacto.
+    Si el bot reinició tarde, lo envía de todas formas mientras sea antes de 9:45 ET.
     """
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date():
         return
     hora_et = ahora.hour * 60 + ahora.minute
-    # Ventana amplia 9:00-9:15 ET para no depender del ciclo exacto de 60s
-    if not (9 * 60 <= hora_et <= 9 * 60 + 15):
+    # Ventana amplia 9:00-9:45 ET
+    if not (9 * 60 <= hora_et <= 9 * 60 + 45):
         return
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
@@ -1349,6 +1350,9 @@ SESGO: [1 oración directa sobre si operar largo, corto o esperar]""",
             elif linea.startswith(("1.", "2.", "3.")): noticias.append(linea[2:].strip())
             elif linea.startswith("RESUMEN:"): resumen = linea.replace("RESUMEN:", "").strip()
             elif linea.startswith("SESGO:"):   sesgo   = linea.replace("SESGO:", "").strip()
+        # Si sesgo quedó vacío, usar el impacto como sesgo por defecto
+        if not sesgo:
+            sesgo = f"Sesgo {impacto.lower()} — ver contexto arriba"
         return {"impacto": impacto, "noticias": noticias,
                 "resumen": resumen, "sesgo": sesgo, "hora": hora_str}
     except Exception as e:
@@ -1766,6 +1770,127 @@ estado_mercado_enviado = False
 contador_ciclos        = 0
 cooldown               = EstadoCooldown()
 
+# ================================================================
+# === SISTEMA DE TRACKING DE POSICIONES ===========================
+# ================================================================
+
+posicion_activa = {
+    "tipo":    None,   # "long" o "short"
+    "precio":  None,   # precio de entrada
+    "activa":  False,
+    "alerta_distribucion_enviada": False,
+}
+
+def evaluar_distribucion_posicion(resultado):
+    """
+    Detecta si las condiciones se están deteriorando contra la posición activa.
+    Usa solo señales técnicas básicas — modelo Haiku, costo mínimo.
+    """
+    if not posicion_activa["activa"]:
+        return False
+    detalle   = resultado["detalle"]
+    dp        = detalle.get("dark_pool", {})
+    rsi       = detalle.get("rsi", 50)
+    precio    = detalle.get("precio", 0)
+    tend      = detalle.get("tendencia", {})
+    dp_distrib = dp.get("interpretacion", "") == "DISTRIBUCION EN DARK POOL"
+    rsi_cayendo = rsi < 45
+    bajo_ema    = not tend.get("sobre_ema", True)
+    if posicion_activa["tipo"] == "long":
+        señales_negativas = sum([dp_distrib, rsi_cayendo, bajo_ema])
+        return señales_negativas >= 2
+    elif posicion_activa["tipo"] == "short":
+        dp_acum     = dp.get("interpretacion", "") == "ACUMULACION INSTITUCIONAL OCULTA"
+        rsi_subiendo = rsi > 55
+        sobre_ema   = tend.get("sobre_ema", False)
+        señales_negativas = sum([dp_acum, rsi_subiendo, sobre_ema])
+        return señales_negativas >= 2
+    return False
+
+def enviar_alerta_distribucion(resultado):
+    """Avisa al trader que las condiciones se están deteriorando."""
+    detalle  = resultado["detalle"]
+    precio   = detalle.get("precio", 0)
+    dp       = detalle.get("dark_pool", {})
+    rsi      = detalle.get("rsi", 50)
+    tipo     = posicion_activa["tipo"].upper()
+    entrada  = posicion_activa["precio"]
+    pnl      = (precio - entrada) if tipo == "LONG" else (entrada - precio)
+    emoji    = "🟢" if tipo == "LONG" else "🔴"
+    msg = (f"⚠️ *DISTRIBUCIÓN DETECTADA — POSICIÓN EN RIESGO*\n{'─'*28}\n"
+           f"{emoji} Posición: `{tipo}` desde `{entrada}`\n"
+           f"💵 Precio actual: `{precio}` | P&L: `{pnl:+.1f}pts`\n"
+           f"{'─'*28}\n"
+           f"🏦 Dark Pool: `{dp.get('interpretacion','N/D')}`\n"
+           f"📉 RSI: `{rsi}` — momentum deteriorándose\n"
+           f"📊 EMA20: `{'por debajo' if tipo=='LONG' else 'por encima'}`\n"
+           f"{'─'*28}\n"
+           f"⚠️ *Considera cerrar o ajustar tu stop.*")
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        print("  [POSICIÓN] ⚠️ Alerta distribución enviada")
+    except Exception as e:
+        print(f"  [POSICIÓN] Error: {e}")
+
+# ── Comandos Telegram ─────────────────────────────────────────
+@bot.message_handler(commands=["long"])
+def cmd_long(message):
+    try:
+        partes = message.text.split()
+        precio = float(partes[1]) if len(partes) > 1 else None
+        if not precio:
+            bot.reply_to(message, "Uso: /long 7575")
+            return
+        posicion_activa.update({"tipo": "long", "precio": precio,
+                                "activa": True, "alerta_distribucion_enviada": False})
+        bot.reply_to(message, f"✅ Posición LONG registrada en {precio}\nTe avisaré si las condiciones se deterioran.")
+        print(f"  [POSICIÓN] Long registrado en {precio}")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+@bot.message_handler(commands=["short"])
+def cmd_short(message):
+    try:
+        partes = message.text.split()
+        precio = float(partes[1]) if len(partes) > 1 else None
+        if not precio:
+            bot.reply_to(message, "Uso: /short 7575")
+            return
+        posicion_activa.update({"tipo": "short", "precio": precio,
+                                "activa": True, "alerta_distribucion_enviada": False})
+        bot.reply_to(message, f"✅ Posición SHORT registrada en {precio}\nTe avisaré si las condiciones se deterioran.")
+        print(f"  [POSICIÓN] Short registrado en {precio}")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+@bot.message_handler(commands=["cerrar"])
+def cmd_cerrar(message):
+    tipo   = posicion_activa.get("tipo", "N/D")
+    precio = posicion_activa.get("precio", 0)
+    posicion_activa.update({"tipo": None, "precio": None,
+                            "activa": False, "alerta_distribucion_enviada": False})
+    bot.reply_to(message, f"✅ Posición {tipo.upper() if tipo else ''} desde {precio} cerrada.\nMonitoreo desactivado.")
+    print("  [POSICIÓN] Posición cerrada manualmente")
+
+@bot.message_handler(commands=["posicion"])
+def cmd_posicion(message):
+    if not posicion_activa["activa"]:
+        bot.reply_to(message, "No hay posición activa.\nUsa /long <precio> o /short <precio>")
+    else:
+        bot.reply_to(message, f"Posición activa: {posicion_activa['tipo'].upper()} desde {posicion_activa['precio']}")
+
+# Iniciar polling de Telegram en hilo separado
+import threading
+def iniciar_polling():
+    try:
+        bot.polling(none_stop=True, interval=2, timeout=20)
+    except Exception as e:
+        print(f"  [POLLING] Error: {e}")
+
+polling_thread = threading.Thread(target=iniciar_polling, daemon=True)
+polling_thread.start()
+print("  [TELEGRAM] Comandos activos: /long /short /cerrar /posicion")
+
 print("=" * 60)
 print("   US500 MONITOR v3.9 — VISION INSTITUCIONAL COMPLETA")
 print("=" * 60)
@@ -1919,7 +2044,13 @@ while True:
             if evaluar_agotamiento(resultado):
                 enviar_alerta_agotamiento(resultado)
 
-        # ── Alerta de contradicción institucional ─────────────
+        # ── Detector de distribución en posición activa ───────
+        if posicion_activa["activa"] and not posicion_activa["alerta_distribucion_enviada"]:
+            if evaluar_distribucion_posicion(resultado):
+                enviar_alerta_distribucion(resultado)
+                posicion_activa["alerta_distribucion_enviada"] = True
+
+        # ── Alerta de contradicción institucional (independiente) ──
         ahora_dia = ahora_ny.date()
         if contradiccion_cache["dia"] != ahora_dia:
             contradiccion_cache["enviada"] = False
@@ -1928,10 +2059,6 @@ while True:
             enviar_alerta_contradiccion(resultado)
             contradiccion_cache["enviada"] = True
 
-        # ── Regla de apertura v3.9 ────────────────────────────
-        # 0-5 min: bloqueo total — datos insuficientes y RSI irreal
-        # 5-30 min: penalización -2 por liquidez baja de apertura
-        # 30+ min: señales normales
         if minutos < 5:
             print(f"  → ⏸ Bloqueo apertura ({minutos:.0f} min < 5) — solo mensaje apertura")
             contador_ciclos += 1
