@@ -88,6 +88,38 @@ RANGO_ALEJAMIENTO_MIN    = 10
 def hora_ny():
     return datetime.now(pytz.timezone("America/New_York"))
 
+def descargar_futuros(period="2d", interval="5m"):
+    """
+    Descarga futuros E-mini S&P500 con múltiples tickers de fallback.
+    yfinance a veces falla con /ES=F los fines de semana o por delisting.
+    Orden: ES=F → /ES=F → ESM26.CME → SPY como último recurso (×10)
+    """
+    tickers_futuros = ["ES=F", "/ES=F", "ESM26.CME"]
+    for ticker in tickers_futuros:
+        try:
+            data = yf.download(ticker, period=period, interval=interval,
+                               progress=False, auto_adjust=True)
+            if not data.empty and len(data) >= 2:
+                print(f"  [FUTUROS] ✅ {ticker} OK")
+                return data
+        except Exception as e:
+            print(f"  [FUTUROS] {ticker} falló: {e}")
+            continue
+    # Último recurso: SPY ×10
+    try:
+        spy = yf.download("SPY", period=period, interval=interval,
+                          progress=False, auto_adjust=True)
+        if not spy.empty:
+            spy_scaled = spy.copy()
+            for col in ["Open","High","Low","Close"]:
+                if col in spy_scaled.columns:
+                    spy_scaled[col] = spy_scaled[col] * 10
+            print("  [FUTUROS] 📊 Usando SPY×10 como proxy de futuros")
+            return spy_scaled
+    except Exception as e:
+        print(f"  [FUTUROS] SPY fallback error: {e}")
+    return pd.DataFrame()
+
 # Días festivos NYSE 2025-2027
 NYSE_FESTIVOS = {
     (2025, 1,  1), (2025, 1, 20), (2025, 2, 17), (2025, 4, 18),
@@ -187,8 +219,8 @@ def obtener_cot_report():
 def _cot_proxy_fallback():
     """Proxy COT via /ES=F vs SPY cuando CFTC no disponible."""
     try:
-        es  = yf.download("/ES=F", period="5d", interval="1d", progress=False)
-        spy = yf.download("SPY",   period="5d", interval="1d", progress=False)
+        es  = descargar_futuros(period="5d", interval="1d")
+        spy = yf.download("SPY", period="5d", interval="1d", progress=False)
         if es.empty or spy.empty:
             cot_cache["disponible"] = False
             return False
@@ -1414,7 +1446,7 @@ def enviar_pre_apertura():
     if not (9 * 60 <= hora_et <= 9 * 60 + 45): return
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
-        es_data       = yf.download("/ES=F", period="2d", interval="5m", progress=False)
+        es_data       = descargar_futuros(period="2d", interval="5m")
         futuro_precio = float(es_data["Close"].iloc[-1]) if not es_data.empty else 0
         futuro_cambio = float((es_data["Close"].iloc[-1] / es_data["Close"].iloc[-12] - 1) * 100) \
                         if len(es_data) >= 12 else 0
@@ -1463,7 +1495,7 @@ def enviar_resumen_dominical():
     print("  [DOMINICAL] Preparando resumen semanal...")
     try:
         obtener_cot_report()
-        es_data       = yf.download("/ES=F", period="5d", interval="1d", progress=False)
+        es_data       = descargar_futuros(period="5d", interval="1d")
         futuro_precio = float(es_data["Close"].iloc[-1]) if not es_data.empty else 0
         futuro_cambio_semana = float((es_data["Close"].iloc[-1] / es_data["Close"].iloc[0] - 1) * 100) \
                                if len(es_data) >= 5 else 0
@@ -1513,7 +1545,7 @@ def monitorear_overnight():
         ahora = hora_ny()
         if (ultimo_alerta_overnight["hora"] and
             (ahora - ultimo_alerta_overnight["hora"]).total_seconds() < 1800): return
-        es_data       = yf.download("/ES=F", period="2d", interval="5m", progress=False)
+        es_data       = descargar_futuros(period="2d", interval="5m")
         if es_data.empty or len(es_data) < 2: return
         precio_actual = float(es_data["Close"].iloc[-1])
         precio_cierre = float(es_data["Close"].iloc[-13])
