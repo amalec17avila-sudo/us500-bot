@@ -1447,9 +1447,10 @@ def enviar_pre_apertura():
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
-        futuro_precio = float(es_data["Close"].iloc[-1]) if not es_data.empty else 0
-        futuro_cambio = float((es_data["Close"].iloc[-1] / es_data["Close"].iloc[-12] - 1) * 100) \
-                        if len(es_data) >= 12 else 0
+        close_es      = es_data["Close"].squeeze() if not es_data.empty and hasattr(es_data["Close"], "squeeze") else (es_data["Close"] if not es_data.empty else None)
+        futuro_precio = float(close_es.iloc[-1]) if close_es is not None else 0
+        futuro_cambio = float((close_es.iloc[-1] / close_es.iloc[-12] - 1) * 100) \
+                        if close_es is not None and len(close_es) >= 12 else 0
         cot_info  = cot_cache
         # Mostrar fuente COT en pre-apertura
         cot_fuente = cot_info.get("fuente", "N/D")
@@ -1496,9 +1497,10 @@ def enviar_resumen_dominical():
     try:
         obtener_cot_report()
         es_data       = descargar_futuros(period="5d", interval="1d")
-        futuro_precio = float(es_data["Close"].iloc[-1]) if not es_data.empty else 0
-        futuro_cambio_semana = float((es_data["Close"].iloc[-1] / es_data["Close"].iloc[0] - 1) * 100) \
-                               if len(es_data) >= 5 else 0
+        close_es      = es_data["Close"].squeeze() if not es_data.empty and hasattr(es_data["Close"], "squeeze") else (es_data["Close"] if not es_data.empty else None)
+        futuro_precio = float(close_es.iloc[-1]) if close_es is not None else 0
+        futuro_cambio_semana = float((close_es.iloc[-1] / close_es.iloc[0] - 1) * 100) \
+                               if close_es is not None and len(close_es) >= 5 else 0
         cot_sesgo  = cot_cache.get("sesgo", "N/D") if cot_cache.get("disponible") else "N/D"
         cot_neto   = cot_cache.get("neto_largo", 0)
         cot_fuente = cot_cache.get("fuente", "N/D")
@@ -1547,8 +1549,9 @@ def monitorear_overnight():
             (ahora - ultimo_alerta_overnight["hora"]).total_seconds() < 1800): return
         es_data       = descargar_futuros(period="2d", interval="5m")
         if es_data.empty or len(es_data) < 2: return
-        precio_actual = float(es_data["Close"].iloc[-1])
-        precio_cierre = float(es_data["Close"].iloc[-13])
+        close_col     = es_data["Close"].squeeze() if hasattr(es_data["Close"], "squeeze") else es_data["Close"]
+        precio_actual = float(close_col.iloc[-1])
+        precio_cierre = float(close_col.iloc[-13]) if len(close_col) >= 13 else float(close_col.iloc[0])
         cambio_pct    = (precio_actual / precio_cierre - 1) * 100
         if abs(cambio_pct) < 0.5: return
         emoji     = "📈" if cambio_pct > 0 else "📉"
