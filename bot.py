@@ -311,9 +311,14 @@ def obtener_gex():
             try:
                 chain = spy.option_chain(exp)
 
+                # Verificar que la columna gamma existe
+                if "gamma" not in chain.calls.columns or "gamma" not in chain.puts.columns:
+                    print(f"  [GEX] Sin columna gamma en {exp} — saltando")
+                    continue
+
                 for _, row in chain.calls.iterrows():
                     strike = float(row["strike"])
-                    gamma  = float(row["gamma"])       if not pd.isna(row["gamma"])       else 0
+                    gamma  = float(row["gamma"])        if not pd.isna(row["gamma"])        else 0
                     oi     = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
                     if gamma <= 0 or oi <= 0: continue
                     gex = gamma * oi * 100 * strike
@@ -321,7 +326,7 @@ def obtener_gex():
 
                 for _, row in chain.puts.iterrows():
                     strike = float(row["strike"])
-                    gamma  = float(row["gamma"])       if not pd.isna(row["gamma"])       else 0
+                    gamma  = float(row["gamma"])        if not pd.isna(row["gamma"])        else 0
                     oi     = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
                     if gamma <= 0 or oi <= 0: continue
                     gex = gamma * oi * 100 * strike
@@ -517,6 +522,17 @@ def obtener_dark_pool():
         high_hoy   = high.iloc[idx_hoy]
         low_hoy    = low.iloc[idx_hoy]
         open_hoy   = open_.iloc[idx_hoy]
+
+        # Asegurar que son Series simples no DataFrames
+        if hasattr(close_hoy,  "columns"): close_hoy  = close_hoy.iloc[:,  0]
+        if hasattr(volume_hoy, "columns"): volume_hoy = volume_hoy.iloc[:, 0]
+        if hasattr(high_hoy,   "columns"): high_hoy   = high_hoy.iloc[:,   0]
+        if hasattr(low_hoy,    "columns"): low_hoy    = low_hoy.iloc[:,    0]
+        if hasattr(open_hoy,   "columns"): open_hoy   = open_hoy.iloc[:,   0]
+        if hasattr(close,      "columns"): close      = close.iloc[:,      0]
+        if hasattr(volume,     "columns"): volume     = volume.iloc[:,     0]
+        if hasattr(high,       "columns"): high       = high.iloc[:,       0]
+        if hasattr(low,        "columns"): low        = low.iloc[:,        0]
 
         vol_historico = volume.iloc[:-len(idx_hoy)] if len(volume) > len(idx_hoy) else volume
         vol_media     = float(vol_historico.mean())
@@ -1447,10 +1463,14 @@ def enviar_pre_apertura():
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
-        close_es      = es_data["Close"].squeeze() if not es_data.empty and hasattr(es_data["Close"], "squeeze") else (es_data["Close"] if not es_data.empty else None)
-        futuro_precio = float(close_es.iloc[-1]) if close_es is not None else 0
-        futuro_cambio = float((close_es.iloc[-1] / close_es.iloc[-12] - 1) * 100) \
-                        if close_es is not None and len(close_es) >= 12 else 0
+        if not es_data.empty:
+            close_es      = es_data["Close"]
+            if hasattr(close_es, "columns"): close_es = close_es.iloc[:, 0]
+            close_es      = close_es.squeeze()
+            futuro_precio = float(close_es.iloc[-1])
+            futuro_cambio = float((close_es.iloc[-1] / close_es.iloc[-12] - 1) * 100)                             if len(close_es) >= 12 else 0.0
+        else:
+            futuro_precio = 0; futuro_cambio = 0.0
         cot_info  = cot_cache
         # Mostrar fuente COT en pre-apertura
         cot_fuente = cot_info.get("fuente", "N/D")
@@ -1497,10 +1517,14 @@ def enviar_resumen_dominical():
     try:
         obtener_cot_report()
         es_data       = descargar_futuros(period="5d", interval="1d")
-        close_es      = es_data["Close"].squeeze() if not es_data.empty and hasattr(es_data["Close"], "squeeze") else (es_data["Close"] if not es_data.empty else None)
-        futuro_precio = float(close_es.iloc[-1]) if close_es is not None else 0
-        futuro_cambio_semana = float((close_es.iloc[-1] / close_es.iloc[0] - 1) * 100) \
-                               if close_es is not None and len(close_es) >= 5 else 0
+        if not es_data.empty:
+            close_es      = es_data["Close"]
+            if hasattr(close_es, "columns"): close_es = close_es.iloc[:, 0]
+            close_es      = close_es.squeeze()
+            futuro_precio = float(close_es.iloc[-1])
+            futuro_cambio_semana = float((close_es.iloc[-1] / close_es.iloc[0] - 1) * 100)                                    if len(close_es) >= 5 else 0.0
+        else:
+            futuro_precio = 0; futuro_cambio_semana = 0.0
         cot_sesgo  = cot_cache.get("sesgo", "N/D") if cot_cache.get("disponible") else "N/D"
         cot_neto   = cot_cache.get("neto_largo", 0)
         cot_fuente = cot_cache.get("fuente", "N/D")
@@ -1549,7 +1573,9 @@ def monitorear_overnight():
             (ahora - ultimo_alerta_overnight["hora"]).total_seconds() < 1800): return
         es_data       = descargar_futuros(period="2d", interval="5m")
         if es_data.empty or len(es_data) < 2: return
-        close_col     = es_data["Close"].squeeze() if hasattr(es_data["Close"], "squeeze") else es_data["Close"]
+        close_col     = es_data["Close"]
+        if hasattr(close_col, "columns"): close_col = close_col.iloc[:, 0]
+        close_col     = close_col.squeeze()
         precio_actual = float(close_col.iloc[-1])
         precio_cierre = float(close_col.iloc[-13]) if len(close_col) >= 13 else float(close_col.iloc[0])
         cambio_pct    = (precio_actual / precio_cierre - 1) * 100
