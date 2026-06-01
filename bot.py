@@ -393,28 +393,42 @@ def obtener_gex():
 
         strikes_ordenados = sorted(gex_filtrado.keys())
 
-        # ── Gamma Flip ────────────────────────────────────────
-        gamma_flip       = None
-        gex_acumulado    = 0
-        gex_acum_anterior = 0
+        # ── Gamma Flip — cruce más cercano al precio actual ───
+        # Recoge TODOS los cruces de GEX positivo→negativo
+        # y devuelve el más cercano al precio spot
+        cruces        = []
+        gex_acumulado = 0
+        gex_acum_ant  = 0
         for strike in strikes_ordenados:
-            gex_acum_anterior = gex_acumulado
-            gex_acumulado    += gex_filtrado[strike]
-            if gex_acum_anterior * gex_acumulado < 0:
-                gamma_flip = strike
-                break
-        if gamma_flip is None:
-            gamma_flip = min(gex_filtrado.keys(), key=lambda k: abs(gex_filtrado[k]))
+            gex_acum_ant   = gex_acumulado
+            gex_acumulado += gex_filtrado[strike]
+            if gex_acum_ant != 0 and gex_acum_ant * gex_acumulado < 0:
+                cruces.append(strike)
 
-        # ── Call Wall ─────────────────────────────────────────
+        if cruces:
+            gamma_flip = min(cruces, key=lambda k: abs(k - precio_spy))
+        else:
+            # Sin cruce — strike con GEX más cercano a cero
+            gamma_flip = min(gex_filtrado.keys(),
+                            key=lambda k: abs(gex_filtrado[k]))
+
+        # ── Call Wall — mayor GEX positivo SOBRE el precio ───
         strikes_arriba = {k: v for k, v in gex_filtrado.items()
                           if k > precio_spy and v > 0}
         call_wall = max(strikes_arriba, key=strikes_arriba.get) if strikes_arriba else None
 
-        # ── Put Wall ──────────────────────────────────────────
+        # ── Put Wall — mayor GEX negativo BAJO el precio ─────
         strikes_abajo = {k: v for k, v in gex_filtrado.items()
                          if k < precio_spy and v < 0}
         put_wall = min(strikes_abajo, key=strikes_abajo.get) if strikes_abajo else None
+
+        # ── Validar coherencia Put Wall < Flip < Call Wall ───
+        if gamma_flip and call_wall and put_wall:
+            if not (put_wall <= gamma_flip <= call_wall):
+                # Flip fuera de rango — usar strike más cercano al precio
+                gamma_flip = min(gex_filtrado.keys(),
+                                key=lambda k: abs(k - precio_spy))
+                print(f"  [GEX] ⚠️ Flip reajustado al strike más cercano: {gamma_flip:.1f}")
 
         # ── Convertir a US500 (×10) ───────────────────────────
         gamma_flip_us500 = round(gamma_flip * 10, 0) if gamma_flip else None
