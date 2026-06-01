@@ -286,15 +286,33 @@ gex_niveles = {
     "fuente":               None,
 }
 
+def _gamma_black_scholes(S, K, T, sigma, r=0.05):
+    """
+    Calcula gamma usando Black-Scholes.
+    S=precio actual, K=strike, T=tiempo en años,
+    sigma=volatilidad implícita, r=tasa libre riesgo
+    """
+    try:
+        import math
+        if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.0
+        d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
+        gamma = math.exp(-0.5 * d1**2) / (S * sigma * math.sqrt(2 * math.pi * T))
+        return max(0.0, gamma)
+    except:
+        return 0.0
+
 def obtener_gex():
     """
     Calcula GEX real desde cadena de opciones SPY via yfinance.
+    Usa gamma de yfinance si está disponible, sino calcula con Black-Scholes
+    usando impliedVolatility que sí devuelve yfinance.
     Gamma Flip = strike donde GEX neto cambia de positivo a negativo.
     Call Wall  = strike con mayor GEX positivo por encima del precio.
     Put Wall   = strike con mayor GEX negativo por debajo del precio.
-    Fórmula: GEX = gamma × open_interest × 100 × precio_strike
     """
     try:
+        import math
+        from datetime import datetime
         spy        = yf.Ticker("SPY")
         precio_spy = spy.fast_info.last_price
         if not precio_spy:
@@ -306,31 +324,57 @@ def obtener_gex():
             return _gex_fallback()
 
         gex_por_strike = {}
+        strikes_procesados = 0
 
         for exp in expiraciones:
             try:
                 chain = spy.option_chain(exp)
+                # Calcular tiempo a expiración en años
+                try:
+                    fecha_exp = datetime.strptime(exp, "%Y-%m-%d")
+                    T = max(1/365, (fecha_exp - datetime.now()).days / 365)
+                except:
+                    T = 30/365  # default 30 días
 
-                # Verificar que la columna gamma existe
-                if "gamma" not in chain.calls.columns or "gamma" not in chain.puts.columns:
-                    print(f"  [GEX] Sin columna gamma en {exp} — saltando")
-                    continue
+                tiene_gamma = "gamma" in chain.calls.columns
 
+                # ── Calls ─────────────────────────────────────
                 for _, row in chain.calls.iterrows():
                     strike = float(row["strike"])
-                    gamma  = float(row["gamma"])        if not pd.isna(row["gamma"])        else 0
-                    oi     = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
-                    if gamma <= 0 or oi <= 0: continue
+                    oi     = float(row["openInterest"]) if not pd.isna(row.get("openInterest", 0)) else 0
+                    if oi <= 0: continue
+
+                    # Intentar gamma real primero, sino Black-Scholes
+                    if tiene_gamma and not pd.isna(row.get("gamma", float("nan"))):
+                        gamma = float(row["gamma"])
+                    else:
+                        iv = float(row["impliedVolatility"]) if not pd.isna(row.get("impliedVolatility", float("nan"))) else 0
+                        gamma = _gamma_black_scholes(precio_spy, strike, T, iv) if iv > 0 else 0
+
+                    if gamma <= 0: continue
                     gex = gamma * oi * 100 * strike
                     gex_por_strike[strike] = gex_por_strike.get(strike, 0) + gex
+                    strikes_procesados += 1
 
+                # ── Puts ──────────────────────────────────────
                 for _, row in chain.puts.iterrows():
                     strike = float(row["strike"])
-                    gamma  = float(row["gamma"])        if not pd.isna(row["gamma"])        else 0
-                    oi     = float(row["openInterest"]) if not pd.isna(row["openInterest"]) else 0
-                    if gamma <= 0 or oi <= 0: continue
+                    oi     = float(row["openInterest"]) if not pd.isna(row.get("openInterest", 0)) else 0
+                    if oi <= 0: continue
+
+                    if tiene_gamma and not pd.isna(row.get("gamma", float("nan"))):
+                        gamma = float(row["gamma"])
+                    else:
+                        iv = float(row["impliedVolatility"]) if not pd.isna(row.get("impliedVolatility", float("nan"))) else 0
+                        gamma = _gamma_black_scholes(precio_spy, strike, T, iv) if iv > 0 else 0
+
+                    if gamma <= 0: continue
                     gex = gamma * oi * 100 * strike
                     gex_por_strike[strike] = gex_por_strike.get(strike, 0) - gex
+                    strikes_procesados += 1
+
+                fuente_gamma = "yfinance" if tiene_gamma else "Black-Scholes"
+                print(f"  [GEX] {exp}: {strikes_procesados} strikes procesados ({fuente_gamma})")
 
             except Exception as e:
                 print(f"  [GEX] Error en expiración {exp}: {e}")
@@ -909,15 +953,26 @@ detector_rango = {"activo": False, "inicio": None,
 def evaluar_detector_rango(precio_actual, gamma_flip):
     global detector_rango
     ahora = hora_ny()
-    if gamma_flip is None:
-        return {"en_rango": False, "suspender": False, "minutos": 0}
-    distancia_flip = abs(precio_actual - gamma_flip)
+
+    # Centro dinámico: Gamma Flip si GEX es real, precio promedio si es estimado
+    gex_es_real = not gex_niveles.get("es_estimado", True)
+    if gex_es_real and gamma_flip is not None:
+        centro_rango = gamma_flip
+    else:
+        # GEX estimado — usar precio promedio dinámico
+        if detector_rango["activo"] and detector_rango.get("precio_centro"):
+            centro_rango = detector_rango["precio_centro"] * 0.8 + precio_actual * 0.2
+            detector_rango["precio_centro"] = centro_rango
+        else:
+            centro_rango = precio_actual
+
+    distancia_flip = abs(precio_actual - centro_rango)
     en_rango = distancia_flip <= RANGO_MAXIMO_PUNTOS / 2
     if en_rango:
         if not detector_rango["activo"]:
             detector_rango["activo"]        = True
             detector_rango["inicio"]        = ahora
-            detector_rango["precio_centro"] = gamma_flip
+            detector_rango["precio_centro"] = precio_actual
         minutos_en_rango = (ahora - detector_rango["inicio"]).total_seconds() / 60 \
                            if detector_rango["inicio"] else 0
         suspender = minutos_en_rango >= RANGO_MINUTOS_MINIMO
@@ -1330,6 +1385,8 @@ def calcular_score_total(datos, minutos_apertura):
 contexto_macro = {
     "resumen": "Sin contexto macro disponible.", "impacto": "NEUTRAL",
     "noticias": [], "sesgo": "", "ultima_actualizacion": None,
+    "actualizaciones_hoy": 0,
+    "fecha_conteo": None,
 }
 
 def buscar_contexto_macro():
@@ -1388,7 +1445,8 @@ def actualizar_contexto_macro(enviar_telegram=True):
         "noticias": resultado.get("noticias", []), "sesgo": resultado.get("sesgo", ""),
         "ultima_actualizacion": hora_ny(),
     })
-    print(f"  [MACRO] Actualizado: {impacto_nuevo} (anterior: {impacto_anterior})")
+    contexto_macro["actualizaciones_hoy"] = contexto_macro.get("actualizaciones_hoy", 0) + 1
+    print(f"  [MACRO] Actualizado: {impacto_nuevo} (anterior: {impacto_anterior}) | Actualización {contexto_macro['actualizaciones_hoy']}/2 del día")
     if enviar_telegram and (impacto_anterior != impacto_nuevo or impacto_anterior == "NEUTRAL"):
         _enviar_macro_telegram(resultado)
     elif enviar_telegram:
@@ -1415,17 +1473,41 @@ def _enviar_macro_telegram(resultado):
         except Exception as e: print(f"  [MACRO] Telegram error: {e}")
 
 def necesita_actualizar_macro():
-    if contexto_macro["ultima_actualizacion"] is None: return True
-    ahora      = hora_ny()
+    ahora       = hora_ny()
+    hoy         = ahora.date()
+
+    # Resetear contador si es un nuevo día
+    if contexto_macro.get("fecha_conteo") != hoy:
+        contexto_macro["actualizaciones_hoy"] = 0
+        contexto_macro["fecha_conteo"]        = hoy
+
+    # Máximo 2 actualizaciones por día
+    if contexto_macro["actualizaciones_hoy"] >= 2:
+        return False
+
+    # Primera vez del día — siempre actualizar
+    if contexto_macro["ultima_actualizacion"] is None:
+        return True
+
     ultima     = contexto_macro["ultima_actualizacion"]
     mins_desde = (ahora - ultima).total_seconds() / 60
-    if mins_desde < 30: return False
+
+    # Cooldown mínimo de 45 minutos entre actualizaciones
+    if mins_desde < 45: return False
+
     hora_actual = ahora.hour * 60 + ahora.minute
     apertura    = 9 * 60 + 30
     mediodia    = 12 * 60 + 30
-    mismo_dia   = ultima.date() == ahora.date()
-    if (apertura <= hora_actual <= apertura + 30) and (not mismo_dia or mins_desde > 180): return True
-    if (mediodia <= hora_actual <= mediodia + 30) and mismo_dia and mins_desde > 60: return True
+    mismo_dia   = ultima.date() == hoy
+
+    # Actualización 1 — ventana apertura
+    if contexto_macro["actualizaciones_hoy"] == 0:
+        if apertura <= hora_actual <= apertura + 15: return True
+
+    # Actualización 2 — ventana mediodía
+    if contexto_macro["actualizaciones_hoy"] == 1:
+        if mediodia <= hora_actual <= mediodia + 15 and mismo_dia and mins_desde > 90: return True
+
     return False
 
 # ================================================================
