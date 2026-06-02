@@ -1560,11 +1560,15 @@ def enviar_pre_apertura():
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
         if not es_data.empty:
-            close_es      = es_data["Close"]
+            close_es = es_data["Close"]
             if hasattr(close_es, "columns"): close_es = close_es.iloc[:, 0]
-            close_es      = close_es.squeeze()
-            futuro_precio = float(close_es.iloc[-1])
-            futuro_cambio = float((close_es.iloc[-1] / close_es.iloc[-12] - 1) * 100)                             if len(close_es) >= 12 else 0.0
+            close_es = close_es.squeeze()
+            if hasattr(close_es, "values"): close_es = close_es.squeeze()
+            futuro_precio = float(close_es.values[-1]) if hasattr(close_es, "values") else float(close_es.iloc[-1])
+            if len(close_es) >= 12:
+                futuro_cambio = float((close_es.values[-1] / close_es.values[-12] - 1) * 100) if hasattr(close_es, "values") else 0.0
+            else:
+                futuro_cambio = 0.0
         else:
             futuro_precio = 0; futuro_cambio = 0.0
         cot_info  = cot_cache
@@ -1581,7 +1585,12 @@ def enviar_pre_apertura():
         breadth_texto = f"Breadth: {breadth_cache.get('verdes',0)}/11 sectores en verde" \
                        if breadth_cache["disponible"] else "Breadth: N/D"
         vix_d  = yf.download("^VIX", period="2d", interval="1d", progress=False)
-        vix_n  = float(vix_d["Close"].iloc[-1]) if not vix_d.empty else 20
+        if not vix_d.empty:
+            vix_close = vix_d["Close"]
+            if hasattr(vix_close, "columns"): vix_close = vix_close.iloc[:, 0]
+            vix_n = float(vix_close.squeeze().iloc[-1])
+        else:
+            vix_n = 20
         fg     = calcular_fear_greed(vix_n, {"disponible": False}, {"disponible": False})
         fg_texto   = f"Fear/Greed: {fg['valor']} — {fg['etiqueta']}"
         macro_imp  = contexto_macro.get("impacto", "calculando...")
