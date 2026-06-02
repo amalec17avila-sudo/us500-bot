@@ -2266,6 +2266,13 @@ while True:
                     f"MERCADO ABIERTO US500 v3.9\nUS500: {spy_precio:.2f} | VIX: {vix_precio:.2f}")
             estado_mercado_enviado = True
 
+        # ── Recalcular GEX cada 60 minutos durante el día ────
+        if gex_niveles["disponible"] and gex_niveles["ultima_actualizacion"]:
+            mins_desde_gex = (ahora_ny - gex_niveles["ultima_actualizacion"]).total_seconds() / 60
+            if mins_desde_gex >= 60:
+                print(f"  [GEX] ♻️ Recalculando niveles ({mins_desde_gex:.0f} min desde última actualización)...")
+                obtener_gex()
+
         # ── Calcular score ────────────────────────────────────
         resultado = calcular_score_total(datos, minutos)
         score     = resultado["score"]
