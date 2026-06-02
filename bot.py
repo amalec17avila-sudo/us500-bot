@@ -1489,6 +1489,9 @@ def _enviar_macro_telegram(resultado):
 def necesita_actualizar_macro():
     ahora       = hora_ny()
     hoy         = ahora.date()
+    hora_actual = ahora.hour * 60 + ahora.minute
+    apertura    = 9 * 60 + 30
+    mediodia    = 12 * 60 + 30
 
     # Resetear contador si es un nuevo día
     if contexto_macro.get("fecha_conteo") != hoy:
@@ -1499,24 +1502,20 @@ def necesita_actualizar_macro():
     if contexto_macro["actualizaciones_hoy"] >= 2:
         return False
 
-    # Primera vez del día — siempre actualizar
-    if contexto_macro["ultima_actualizacion"] is None:
-        return True
-
     ultima     = contexto_macro["ultima_actualizacion"]
-    mins_desde = (ahora - ultima).total_seconds() / 60
+    mins_desde = (ahora - ultima).total_seconds() / 60 if ultima else 9999
+    mismo_dia  = ultima.date() == hoy if ultima else False
 
-    # Cooldown mínimo de 45 minutos entre actualizaciones
-    if mins_desde < 45: return False
+    # Cooldown mínimo absoluto de 45 minutos — aplica SIEMPRE incluso tras reinicio
+    # Evita spam cuando el bot reinicia múltiples veces
+    if ultima and mins_desde < 45: return False
 
-    hora_actual = ahora.hour * 60 + ahora.minute
-    apertura    = 9 * 60 + 30
-    mediodia    = 12 * 60 + 30
-    mismo_dia   = ultima.date() == hoy
-
-    # Actualización 1 — ventana apertura
+    # Actualización 1 — ventana apertura (solo si no hubo macro hoy)
     if contexto_macro["actualizaciones_hoy"] == 0:
+        # Si es primera vez del día Y estamos en ventana de apertura
         if apertura <= hora_actual <= apertura + 15: return True
+        # Si nunca se actualizó hoy y ya pasó apertura — actualizar una vez
+        if not mismo_dia and hora_actual > apertura + 15: return True
 
     # Actualización 2 — ventana mediodía
     if contexto_macro["actualizaciones_hoy"] == 1:
@@ -2232,38 +2231,60 @@ while True:
             print("  [INIT] Obteniendo Put/Call ratio...")
             obtener_put_call_ratio()
 
-            macro_str  = contexto_macro.get("impacto", "calculando...")
-            gex_msg    = ""
-            if gex_niveles["disponible"]:
-                fuente_gex = gex_niveles.get("fuente", "EST")
-                gex_msg    = (f"\n⚡ GEX({fuente_gex}): Flip:`{gex_niveles['gamma_flip']}` | "
-                             f"Call:`{gex_niveles['call_wall']}` | Put:`{gex_niveles['put_wall']}`")
-            breadth_msg = ""
-            if breadth_cache["disponible"]:
-                breadth_msg = f"\n📊 Breadth: `{breadth_cache['verdes']}/11` sectores alcistas"
-            cot_msg = ""
-            if cot_cache["disponible"]:
-                sesgo_cot  = cot_cache["sesgo"]
-                neto_cot   = cot_cache.get("neto_largo", 0)
-                fuente_cot = cot_cache.get("fuente", "?")
-                emoji_cot  = "🟢" if "ALCISTA" in sesgo_cot else ("🔴" if "BAJISTA" in sesgo_cot else "⚪")
-                cot_msg    = f"\n{emoji_cot} COT ({fuente_cot}): `{sesgo_cot}` ({neto_cot:+,} contratos)"
-            dp_msg = ""
-            if dark_pool_cache["disponible"]:
-                tendencia_dp = dark_pool_cache.get("tendencia", "NEUTRAL")
-                fuente_dp    = dark_pool_cache.get("fuente", "?")
-                dp_msg       = f"\n🏦 DarkPool({fuente_dp}): `{tendencia_dp}`"
+            macro_str = contexto_macro.get("impacto", "calculando...")
+
+            # Cada bloque protegido independientemente
+            gex_msg = ""
             try:
-                bot.send_message(TELEGRAM_CHAT_ID,
-                    f"🔔 *MERCADO ABIERTO — US500 v3.9*\n"
-                    f"US500: `{spy_precio:.2f}` | VIX: `{vix_precio:.2f}`\n"
-                    f"Macro: `{macro_str}`"
-                    f"{gex_msg}{breadth_msg}{cot_msg}{dp_msg}\n"
-                    f"Sistema v3.9 activo. Ciclo: 1 min.",
-                    parse_mode="Markdown")
-            except:
-                bot.send_message(TELEGRAM_CHAT_ID,
-                    f"MERCADO ABIERTO US500 v3.9\nUS500: {spy_precio:.2f} | VIX: {vix_precio:.2f}")
+                if gex_niveles["disponible"]:
+                    fuente_gex = str(gex_niveles.get("fuente", "?"))
+                    flip  = str(gex_niveles.get("gamma_flip", "N/D"))
+                    call  = str(gex_niveles.get("call_wall",  "N/D"))
+                    put   = str(gex_niveles.get("put_wall",   "N/D"))
+                    gex_msg = f"\n⚡ GEX({fuente_gex}): Flip:`{flip}` | Call:`{call}` | Put:`{put}`"
+            except Exception as eg: print(f"  [APERTURA] gex_msg error: {eg}")
+
+            breadth_msg = ""
+            try:
+                if breadth_cache["disponible"]:
+                    breadth_msg = f"\n📊 Breadth: `{int(breadth_cache['verdes'])}/11` sectores alcistas"
+            except Exception as eb: print(f"  [APERTURA] breadth_msg error: {eb}")
+
+            cot_msg = ""
+            try:
+                if cot_cache["disponible"]:
+                    sesgo_cot  = str(cot_cache.get("sesgo", "N/D"))
+                    neto_cot   = int(cot_cache.get("neto_largo", 0))
+                    fuente_cot = str(cot_cache.get("fuente", "?"))
+                    emoji_cot  = "🟢" if "ALCISTA" in sesgo_cot else ("🔴" if "BAJISTA" in sesgo_cot else "⚪")
+                    cot_msg    = f"\n{emoji_cot} COT({fuente_cot}): `{sesgo_cot}` ({neto_cot:+,})"
+            except Exception as ec: print(f"  [APERTURA] cot_msg error: {ec}")
+
+            dp_msg = ""
+            try:
+                if dark_pool_cache["disponible"]:
+                    tend_dp   = str(dark_pool_cache.get("tendencia", "N/D"))
+                    fuente_dp = str(dark_pool_cache.get("fuente", "?"))
+                    dp_msg    = f"\n🏦 Dark Pool({fuente_dp}): `{tend_dp}`"
+            except Exception as ed: print(f"  [APERTURA] dp_msg error: {ed}")
+
+            try:
+                msg_apertura = (f"🔔 *MERCADO ABIERTO — US500 v3.9*\n"
+                               f"US500: `{spy_precio:.2f}` | VIX: `{vix_precio:.2f}`\n"
+                               f"Macro: `{macro_str}`"
+                               f"{gex_msg}{breadth_msg}{cot_msg}{dp_msg}\n"
+                               f"Sistema v3.9 activo. Ciclo: 1 min.")
+                bot.send_message(TELEGRAM_CHAT_ID, msg_apertura, parse_mode="Markdown")
+                print("  [APERTURA] ✅ Mensaje completo enviado")
+            except Exception as e:
+                print(f"  [APERTURA] Error Markdown: {e}")
+                try:
+                    fallback = (f"MERCADO ABIERTO US500 v3.9\n"
+                               f"US500: {spy_precio:.2f} | VIX: {vix_precio:.2f}\n"
+                               f"Macro: {macro_str}\n"
+                               f"GEX: {gex_msg.replace('`','').replace('*','').strip() if gex_msg else 'N/D'}")
+                    bot.send_message(TELEGRAM_CHAT_ID, fallback)
+                except: pass
             estado_mercado_enviado = True
 
         # ── Recalcular GEX cada 60 minutos durante el día ────
