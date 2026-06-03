@@ -1498,28 +1498,38 @@ def necesita_actualizar_macro():
         contexto_macro["actualizaciones_hoy"] = 0
         contexto_macro["fecha_conteo"]        = hoy
 
-    # Máximo 2 actualizaciones por día
+    # Máximo 2 actualizaciones por día — límite absoluto
     if contexto_macro["actualizaciones_hoy"] >= 2:
         return False
 
     ultima     = contexto_macro["ultima_actualizacion"]
-    mins_desde = (ahora - ultima).total_seconds() / 60 if ultima else 9999
     mismo_dia  = ultima.date() == hoy if ultima else False
 
-    # Cooldown mínimo absoluto de 45 minutos — aplica SIEMPRE incluso tras reinicio
-    # Evita spam cuando el bot reinicia múltiples veces
-    if ultima and mins_desde < 45: return False
+    # Cooldown mínimo absoluto de 60 minutos entre cualquier actualización
+    # Aplica SIEMPRE — incluso si ultima es None pero hubo actualizaciones hoy
+    if ultima:
+        mins_desde = (ahora - ultima).total_seconds() / 60
+        if mins_desde < 60: return False
 
-    # Actualización 1 — ventana apertura (solo si no hubo macro hoy)
+    # Actualización 1 — solo en ventana de apertura
+    # Si el bot reinicia fuera de esa ventana NO envía macro 1
     if contexto_macro["actualizaciones_hoy"] == 0:
-        # Si es primera vez del día Y estamos en ventana de apertura
-        if apertura <= hora_actual <= apertura + 15: return True
-        # Si nunca se actualizó hoy y ya pasó apertura — actualizar una vez
-        if not mismo_dia and hora_actual > apertura + 15: return True
+        if apertura <= hora_actual <= apertura + 15:
+            return True
+        # Reinicio tardío — solo actualizar si es antes del mediodía
+        # y nunca se actualizó hoy
+        if not mismo_dia and apertura + 15 < hora_actual < mediodia:
+            return True
+        return False  # ← Fuera de ventana = NO actualizar
 
-    # Actualización 2 — ventana mediodía
+    # Actualización 2 — solo en ventana de mediodía
+    # Requiere que ultima exista Y sea del mismo día
     if contexto_macro["actualizaciones_hoy"] == 1:
-        if mediodia <= hora_actual <= mediodia + 15 and mismo_dia and mins_desde > 90: return True
+        if (mediodia <= hora_actual <= mediodia + 15
+                and mismo_dia and ultima
+                and (ahora - ultima).total_seconds() / 60 >= 60):
+            return True
+        return False  # ← Fuera de ventana = NO actualizar
 
     return False
 
