@@ -57,6 +57,7 @@ from datetime import datetime, timedelta
 TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
+TRADIER_TOKEN     = os.environ.get("TRADIER_TOKEN")  # Opcional — greeks reales
 
 for var, nombre in [
     (TELEGRAM_TOKEN,    "TELEGRAM_TOKEN"),
@@ -65,6 +66,11 @@ for var, nombre in [
 ]:
     if not var:
         raise EnvironmentError(f"❌ Variable de entorno faltante: {nombre}")
+
+if TRADIER_TOKEN:
+    print("  [TRADIER] ✅ Token disponible — greeks reales habilitados")
+else:
+    print("  [TRADIER] 📊 Sin token — usando Black-Scholes")
 
 bot           = telebot.TeleBot(TELEGRAM_TOKEN)
 claude_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
@@ -286,6 +292,95 @@ gex_niveles = {
     "fuente":               None,
 }
 
+
+def _obtener_gex_tradier(precio_spy):
+    """
+    Obtiene greeks reales de opciones SPY desde Tradier API.
+    Devuelve diccionario {strike: gex_neto} con gamma real del exchange.
+    Mucho más preciso que Black-Scholes — greeks calculados por el exchange.
+    """
+    if not TRADIER_TOKEN:
+        return None
+
+    try:
+        import urllib.request
+        import json
+        from datetime import datetime, timedelta
+
+        # Obtener expiraciones disponibles
+        url_exp = "https://api.tradier.com/v1/markets/options/expirations?symbol=SPY&includeAllRoots=true"
+        req = urllib.request.Request(url_exp, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}",
+            "Accept": "application/json"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data_exp = json.loads(resp.read().decode())
+
+        expiraciones = data_exp.get("expirations", {}).get("date", [])
+        if not expiraciones:
+            print("  [TRADIER] Sin expiraciones disponibles")
+            return None
+
+        # Usar las 3 primeras expiraciones
+        if isinstance(expiraciones, str):
+            expiraciones = [expiraciones]
+        expiraciones = expiraciones[:3]
+
+        gex_por_strike = {}
+        strikes_procesados = 0
+
+        for exp in expiraciones:
+            try:
+                url_chain = (f"https://api.tradier.com/v1/markets/options/chains"
+                           f"?symbol=SPY&expiration={exp}&greeks=true")
+                req = urllib.request.Request(url_chain, headers={
+                    "Authorization": f"Bearer {TRADIER_TOKEN}",
+                    "Accept": "application/json"
+                })
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data_chain = json.loads(resp.read().decode())
+
+                opciones = data_chain.get("options", {}).get("option", [])
+                if not opciones:
+                    continue
+
+                for opcion in opciones:
+                    strike    = float(opcion.get("strike", 0))
+                    oi        = float(opcion.get("open_interest", 0))
+                    tipo      = opcion.get("option_type", "")
+                    greeks    = opcion.get("greeks", {})
+
+                    if not greeks or oi <= 0 or strike <= 0:
+                        continue
+
+                    gamma = float(greeks.get("gamma", 0) or 0)
+                    if gamma <= 0:
+                        continue
+
+                    gex = gamma * oi * 100 * strike
+
+                    if tipo == "call":
+                        gex_por_strike[strike] = gex_por_strike.get(strike, 0) + gex
+                    elif tipo == "put":
+                        gex_por_strike[strike] = gex_por_strike.get(strike, 0) - gex
+
+                    strikes_procesados += 1
+
+                print(f"  [TRADIER] {exp}: {strikes_procesados} strikes con greeks reales")
+
+            except Exception as e:
+                print(f"  [TRADIER] Error en {exp}: {e}")
+                continue
+
+        if gex_por_strike:
+            print(f"  [TRADIER] ✅ {len(gex_por_strike)} strikes únicos procesados")
+            return gex_por_strike
+        return None
+
+    except Exception as e:
+        print(f"  [TRADIER] Error general: {e}")
+        return None
+
 def _gamma_black_scholes(S, K, T, sigma, r=0.05):
     """
     Calcula gamma usando Black-Scholes.
@@ -303,12 +398,11 @@ def _gamma_black_scholes(S, K, T, sigma, r=0.05):
 
 def obtener_gex():
     """
-    Calcula GEX real desde cadena de opciones SPY via yfinance.
-    Usa gamma de yfinance si está disponible, sino calcula con Black-Scholes
-    usando impliedVolatility que sí devuelve yfinance.
-    Gamma Flip = strike donde GEX neto cambia de positivo a negativo.
-    Call Wall  = strike con mayor GEX positivo por encima del precio.
-    Put Wall   = strike con mayor GEX negativo por debajo del precio.
+    Calcula GEX real desde opciones SPY.
+    Jerarquía:
+    1. Tradier API — greeks reales del exchange (95% confiable)
+    2. yfinance option_chain() + Black-Scholes (75% confiable)
+    3. Fallback estimado geométrico
     """
     try:
         import math
@@ -319,6 +413,14 @@ def obtener_gex():
             return _gex_fallback()
 
         precio_us500 = precio_spy * 10
+
+        # ── Intentar Tradier primero si token disponible ──────
+        if TRADIER_TOKEN:
+            gex_por_strike = _obtener_gex_tradier(precio_spy)
+            if gex_por_strike:
+                return _procesar_gex(gex_por_strike, precio_spy, precio_us500, "TRADIER")
+
+        # ── Fallback: yfinance + Black-Scholes ────────────────
         expiraciones = spy.options[:3] if len(spy.options) >= 3 else spy.options
         if not expiraciones:
             return _gex_fallback()
@@ -383,8 +485,21 @@ def obtener_gex():
         if not gex_por_strike:
             return _gex_fallback()
 
-        rango_min = precio_spy * 0.90
-        rango_max = precio_spy * 1.10
+        return _procesar_gex(gex_por_strike, precio_spy, precio_us500, "OPTION_CHAIN")
+
+    except Exception as e:
+        print(f"  [GEX] option_chain error: {e}")
+        return _gex_fallback()
+
+
+def _procesar_gex(gex_por_strike, precio_spy, precio_us500, fuente):
+    """
+    Procesa el diccionario {strike: gex_neto} y extrae Flip, Call Wall, Put Wall.
+    Función compartida entre Tradier y yfinance para evitar duplicar código.
+    """
+    try:
+        rango_min    = precio_spy * 0.90
+        rango_max    = precio_spy * 1.10
         gex_filtrado = {k: v for k, v in gex_por_strike.items()
                         if rango_min <= k <= rango_max}
 
@@ -394,8 +509,6 @@ def obtener_gex():
         strikes_ordenados = sorted(gex_filtrado.keys())
 
         # ── Gamma Flip — cruce más cercano al precio actual ───
-        # Recoge TODOS los cruces de GEX positivo→negativo
-        # y devuelve el más cercano al precio spot
         cruces        = []
         gex_acumulado = 0
         gex_acum_ant  = 0
@@ -408,7 +521,6 @@ def obtener_gex():
         if cruces:
             gamma_flip = min(cruces, key=lambda k: abs(k - precio_spy))
         else:
-            # Sin cruce — strike con GEX más cercano a cero
             gamma_flip = min(gex_filtrado.keys(),
                             key=lambda k: abs(gex_filtrado[k]))
 
@@ -425,10 +537,9 @@ def obtener_gex():
         # ── Validar coherencia Put Wall < Flip < Call Wall ───
         if gamma_flip and call_wall and put_wall:
             if not (put_wall <= gamma_flip <= call_wall):
-                # Flip fuera de rango — usar strike más cercano al precio
                 gamma_flip = min(gex_filtrado.keys(),
                                 key=lambda k: abs(k - precio_spy))
-                print(f"  [GEX] ⚠️ Flip reajustado al strike más cercano: {gamma_flip:.1f}")
+                print(f"  [GEX] ⚠️ Flip reajustado: {gamma_flip:.1f}")
 
         # ── Convertir a US500 (×10) ───────────────────────────
         gamma_flip_us500 = round(gamma_flip * 10, 0) if gamma_flip else None
@@ -445,14 +556,14 @@ def obtener_gex():
             "ultima_actualizacion": hora_ny(),
             "disponible":           True,
             "es_estimado":          False,
-            "fuente":               "OPTION_CHAIN",
+            "fuente":               fuente,
             "strikes_totales":      len(gex_filtrado),
         })
-        print(f"  [GEX] ✅ REAL — Flip:{gamma_flip_us500} | Call:{call_wall_us500} | Put:{put_wall_us500} | Strikes:{len(gex_filtrado)}")
+        print(f"  [GEX] ✅ {fuente} — Flip:{gamma_flip_us500} | Call:{call_wall_us500} | Put:{put_wall_us500} | Strikes:{len(gex_filtrado)}")
         return True
 
     except Exception as e:
-        print(f"  [GEX] option_chain error: {e}")
+        print(f"  [GEX] _procesar_gex error: {e}")
         return _gex_fallback()
 
 def _gex_fallback():
