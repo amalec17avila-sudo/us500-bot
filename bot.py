@@ -2408,10 +2408,10 @@ while True:
                 except: pass
             estado_mercado_enviado = True
 
-        # ── Recalcular GEX cada 60 minutos durante el día ────
+        # ── Recalcular GEX cada 30 minutos durante el día ────
         if gex_niveles["disponible"] and gex_niveles["ultima_actualizacion"]:
             mins_desde_gex = (ahora_ny - gex_niveles["ultima_actualizacion"]).total_seconds() / 60
-            if mins_desde_gex >= 60:
+            if mins_desde_gex >= 30:
                 print(f"  [GEX] ♻️ Recalculando niveles ({mins_desde_gex:.0f} min desde última actualización)...")
                 obtener_gex()
 
