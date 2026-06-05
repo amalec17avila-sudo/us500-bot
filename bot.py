@@ -2415,6 +2415,13 @@ while True:
                 print(f"  [GEX] ♻️ Recalculando niveles ({mins_desde_gex:.0f} min desde última actualización)...")
                 obtener_gex()
 
+        # ── Recalcular Dark Pool cada 30 minutos durante el día ──
+        if dark_pool_cache["disponible"] and dark_pool_cache["ultima_actualizacion"]:
+            mins_desde_dp = (ahora_ny - dark_pool_cache["ultima_actualizacion"]).total_seconds() / 60
+            if mins_desde_dp >= 30:
+                print(f"  [DARK_POOL] ♻️ Recalculando ({mins_desde_dp:.0f} min desde última actualización)...")
+                obtener_dark_pool()
+
         # ── Calcular score ────────────────────────────────────
         resultado = calcular_score_total(datos, minutos)
         score     = resultado["score"]
