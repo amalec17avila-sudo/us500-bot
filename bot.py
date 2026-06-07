@@ -661,6 +661,22 @@ dark_pool_cache = {
     "fuente":               None,
 }
 
+# Estado para alertas de proximidad GEX
+gex_proximidad_cache = {
+    "ultima_alerta_flip":      None,
+    "ultima_alerta_call_wall": None,
+    "ultima_alerta_put_wall":  None,
+}
+
+# Estado para detector de squeeze de volatilidad
+squeeze_cache = {
+    "activo":          False,
+    "inicio":          None,
+    "rango_promedio":  None,
+    "alerta_enviada":  False,
+    "dia":             None,
+}
+
 # Estado para Options Sweep Detection via Tradier
 sweep_cache = {
     "ultimo_sweep":   None,
@@ -680,6 +696,145 @@ pc_semanal_cache = {
     "sesgo":                "NEUTRAL",
 }
 
+
+
+def verificar_proximidad_gex(precio_actual):
+    """
+    Alerta cuando el precio está a 5 puntos del Flip, Call Wall o Put Wall.
+    Da tiempo de preparar entrada antes de que llegue al nivel.
+    """
+    if not gex_niveles["disponible"]:
+        return
+
+    ahora      = hora_ny()
+    flip       = gex_niveles.get("gamma_flip")
+    call_wall  = gex_niveles.get("call_wall")
+    put_wall   = gex_niveles.get("put_wall")
+    UMBRAL_PTS = 5  # puntos US500
+
+    niveles = [
+        (flip,      "Gamma Flip",  "⚡", "gex_proximidad_cache", "ultima_alerta_flip"),
+        (call_wall, "Call Wall",   "🟢", "gex_proximidad_cache", "ultima_alerta_call_wall"),
+        (put_wall,  "Put Wall",    "🔴", "gex_proximidad_cache", "ultima_alerta_put_wall"),
+    ]
+
+    for nivel, nombre, emoji, _, cache_key in niveles:
+        if not nivel:
+            continue
+        distancia = abs(precio_actual - nivel)
+        if distancia <= UMBRAL_PTS:
+            ultima = gex_proximidad_cache[cache_key]
+            # Solo alertar si han pasado al menos 15 minutos desde la última alerta de este nivel
+            if ultima and (ahora - ultima).total_seconds() / 60 < 15:
+                continue
+            gex_proximidad_cache[cache_key] = ahora
+            direccion = "↑" if precio_actual < nivel else "↓"
+            try:
+                bot.send_message(TELEGRAM_CHAT_ID,
+                    f"{emoji} *PROXIMIDAD {nombre.upper()}*\n"
+                    f"Precio: `{precio_actual:.1f}` {direccion} `{nivel}` ({distancia:.1f} pts)\n"
+                    f"⚡ Posible rebote o ruptura inminente.",
+                    parse_mode="Markdown")
+                print(f"  [GEX_PROX] {emoji} Alerta {nombre}: {precio_actual:.1f} a {distancia:.1f} pts")
+            except Exception as e:
+                print(f"  [GEX_PROX] Error: {e}")
+
+
+def detectar_squeeze_volatilidad(datos, precio_actual):
+    """
+    Detecta cuando el precio consolida en rango estrecho por 15+ minutos.
+    Anticipa movimiento explosivo inminente en cualquier dirección.
+    Rango estrecho = menos de 0.1% del precio actual durante 15 min.
+    """
+    ahora = hora_ny()
+    hoy   = ahora.date()
+
+    # Resetear si es nuevo día
+    if squeeze_cache["dia"] != hoy:
+        squeeze_cache.update({
+            "activo": False, "inicio": None,
+            "rango_promedio": None, "alerta_enviada": False, "dia": hoy
+        })
+
+    try:
+        spy   = datos["spy"]
+        high  = datos["high"]
+        low   = datos["low"]
+
+        if len(high) < 15 or len(low) < 15:
+            return
+
+        # Calcular rango de los últimos 15 minutos
+        rango_15min = float(high.iloc[-15:].max() - low.iloc[-15:].min())
+        umbral_squeeze = precio_actual * 0.001  # 0.1% del precio
+
+        if rango_15min <= umbral_squeeze:
+            if not squeeze_cache["activo"]:
+                squeeze_cache["activo"]   = True
+                squeeze_cache["inicio"]   = ahora
+                squeeze_cache["rango_promedio"] = rango_15min
+                print(f"  [SQUEEZE] 🔄 Compresión detectada — rango {rango_15min:.1f} pts")
+
+            # Alertar si lleva 15+ minutos en squeeze y no ha alertado
+            if squeeze_cache["inicio"]:
+                mins_squeeze = (ahora - squeeze_cache["inicio"]).total_seconds() / 60
+                if mins_squeeze >= 15 and not squeeze_cache["alerta_enviada"]:
+                    squeeze_cache["alerta_enviada"] = True
+                    try:
+                        bot.send_message(TELEGRAM_CHAT_ID,
+                            f"🔄 *SQUEEZE DE VOLATILIDAD DETECTADO*\n"
+                            f"────────────────────────────\n"
+                            f"📊 Rango comprimido: `{rango_15min:.1f} pts` ({mins_squeeze:.0f} min)\n"
+                            f"💵 Precio actual: `{precio_actual:.1f}`\n"
+                            f"────────────────────────────\n"
+                            f"⚡ Movimiento explosivo inminente en cualquier dirección.\n"
+                            f"👀 Preparate para la ruptura.",
+                            parse_mode="Markdown")
+                        print(f"  [SQUEEZE] ⚡ Alerta enviada — {mins_squeeze:.0f} min en compresión")
+                    except Exception as e:
+                        print(f"  [SQUEEZE] Error: {e}")
+        else:
+            # Rango se expandió — squeeze terminó
+            if squeeze_cache["activo"]:
+                print(f"  [SQUEEZE] ✅ Compresión terminada — rango expandido a {rango_15min:.1f} pts")
+            squeeze_cache["activo"]        = False
+            squeeze_cache["inicio"]        = None
+            squeeze_cache["alerta_enviada"] = False
+
+    except Exception as e:
+        print(f"  [SQUEEZE] Error: {e}")
+
+
+def detectar_divergencia_dark_pool(precio_actual, resultado):
+    """
+    Detecta cuando precio sube pero Dark Pool distribuye
+    o precio baja pero Dark Pool acumula.
+    Señal de que institucionales van en contra del precio visible.
+    """
+    try:
+        if not dark_pool_cache["disponible"]:
+            return
+
+        dp_tendencia = dark_pool_cache.get("tendencia", "NEUTRAL")
+        detalle      = resultado.get("detalle", {})
+        tendencia    = detalle.get("tendencia", {})
+        ema_score    = tendencia.get("score", 0) if isinstance(tendencia, dict) else 0
+
+        # Precio subiendo (EMA positiva) pero Dark Pool distribuyendo
+        if ema_score > 0 and dp_tendencia in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]:
+            print(f"  [DIV_DP] ⚠️ Divergencia bajista — precio ↑ pero DP distribuyendo")
+            return "BAJISTA"
+
+        # Precio bajando (EMA negativa) pero Dark Pool acumulando
+        if ema_score < 0 and dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]:
+            print(f"  [DIV_DP] ⚠️ Divergencia alcista — precio ↓ pero DP acumulando")
+            return "ALCISTA"
+
+        return None
+
+    except Exception as e:
+        print(f"  [DIV_DP] Error: {e}")
+        return None
 
 def detectar_options_sweep():
     """
@@ -1911,6 +2066,74 @@ def procesar_macro_post_evento(nombre_evento):
 
 pre_apertura_enviado = {"dia": None}
 
+
+def obtener_calendario_economico():
+    """
+    Obtiene eventos económicos de alto impacto para la semana actual
+    via web search usando el módulo de Claude.
+    Retorna lista de eventos con hora ET y descripción.
+    """
+    try:
+        from datetime import datetime, timedelta
+        import urllib.request, json
+
+        ahora     = hora_ny()
+        hoy       = ahora.date()
+        lunes     = hoy - timedelta(days=hoy.weekday())
+        viernes   = lunes + timedelta(days=4)
+
+        # Eventos fijos de alto impacto que siempre buscamos
+        eventos_conocidos = {
+            "NFP":     "Nóminas No Agrícolas (NFP)",
+            "CPI":     "Índice de Precios al Consumidor (CPI)",
+            "FOMC":    "Decisión de Tasas Fed (FOMC)",
+            "PCE":     "Gasto Consumo Personal (PCE)",
+            "JOLTS":   "Ofertas de Empleo (JOLTS)",
+            "ADP":     "Empleo Privado ADP",
+            "GDP":     "PIB Trimestral (GDP)",
+            "PPI":     "Índice Precios Productor (PPI)",
+            "CLAIMS":  "Solicitudes Desempleo",
+            "ISM":     "ISM Manufacturero/Servicios",
+        }
+
+        # Usar el cliente Claude para buscar eventos de la semana
+        prompt = (f"Dame solo los eventos económicos de ALTO IMPACTO para EEUU "
+                 f"de la semana del {lunes} al {viernes} de 2026. "
+                 f"Formato exacto por línea: HH:MM ET | NOMBRE_EVENTO | PREVISION "
+                 f"Solo eventos con impacto 3 toros (máximo impacto). "
+                 f"Si no hay eventos importantes esa semana, responde: NINGUNO. "
+                 f"Máximo 6 eventos. No incluyas explicaciones.")
+
+        try:
+            respuesta = claude_client.messages.create(
+                model=MODELO_SEÑALES, max_tokens=300,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            texto = respuesta.content[0].text.strip()
+            if "NINGUNO" in texto.upper():
+                return []
+
+            eventos = []
+            for linea in texto.split("\n"):
+                linea = linea.strip()
+                if "|" in linea and len(linea) > 5:
+                    partes = [p.strip() for p in linea.split("|")]
+                    if len(partes) >= 2:
+                        eventos.append({
+                            "hora":    partes[0] if len(partes) > 0 else "TBD",
+                            "nombre":  partes[1] if len(partes) > 1 else linea,
+                            "prevision": partes[2] if len(partes) > 2 else "N/D",
+                        })
+            return eventos[:6]
+
+        except Exception as e:
+            print(f"  [CALENDARIO] Error Claude: {e}")
+            return []
+
+    except Exception as e:
+        print(f"  [CALENDARIO] Error general: {e}")
+        return []
+
 def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
@@ -1955,6 +2178,21 @@ def enviar_pre_apertura():
         fg_texto   = f"Fear/Greed: {fg['valor']} — {fg['etiqueta']}"
         macro_imp  = contexto_macro.get("impacto", "calculando...")
         emoji_dir  = "📈" if futuro_cambio > 0 else "📉"
+
+        # ── Calendario económico de la semana ─────────────────
+        calendario_texto = ""
+        try:
+            eventos = obtener_calendario_economico()
+            if eventos:
+                calendario_texto = "\n📅 *Eventos esta semana:*\n"
+                for ev in eventos:
+                    calendario_texto += f"  • `{ev['hora']}` — {ev['nombre']}"
+                    if ev['prevision'] != "N/D":
+                        calendario_texto += f" (prev: {ev['prevision']})"
+                    calendario_texto += "\n"
+        except Exception as e:
+            print(f"  [CALENDARIO] Error en pre-apertura: {e}")
+
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
                f"⏰ Mercado abre en ~15 minutos\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
@@ -1962,7 +2200,8 @@ def enviar_pre_apertura():
                f"🌡️ {fg_texto}\n"
                f"📉 {breadth_texto}\n"
                f"🌍 Macro: `{macro_imp}`"
-               f"{gex_texto}")
+               f"{gex_texto}"
+               f"{calendario_texto}")
         bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         pre_apertura_enviado["dia"] = ahora.date()
         print("  [PRE-APERTURA] ✅ Enviado")
@@ -2701,6 +2940,20 @@ while True:
                 (ahora_ny - pc_semanal_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
                 obtener_pc_ratio_semanal()
 
+        # ── Alertas proximidad GEX ───────────────────────────
+        if gex_niveles["disponible"] and datos:
+            try:
+                precio_act = float(datos["spy"].iloc[-1])
+                verificar_proximidad_gex(precio_act * 10)  # convertir SPY a US500
+            except: pass
+
+        # ── Detector squeeze de volatilidad ──────────────────
+        if datos:
+            try:
+                precio_act = float(datos["spy"].iloc[-1]) * 10
+                detectar_squeeze_volatilidad(datos, precio_act)
+            except: pass
+
         # ── Options Sweep Detection cada 5 minutos ────────────
         if TRADIER_TOKEN and contador_ciclos % 5 == 0:
             sweep = detectar_options_sweep()
@@ -2793,6 +3046,27 @@ while True:
         if not contradiccion_cache["enviada"] and tipo_contradiccion:
             enviar_alerta_contradiccion(resultado, tipo_contradiccion)
             contradiccion_cache["enviada"] = True
+
+        # ── Divergencia precio-Dark Pool ──────────────────────
+        if datos:
+            try:
+                div_dp = detectar_divergencia_dark_pool(precio_actual, resultado)
+                if div_dp:
+                    emoji_div = "📉" if div_dp == "BAJISTA" else "📈"
+                    dp_tend   = dark_pool_cache.get("tendencia", "N/D")
+                    dir_precio = "subiendo" if div_dp == "BAJISTA" else "bajando"
+                    dir_dp     = "distribuyendo" if div_dp == "BAJISTA" else "acumulando"
+                    try:
+                        bot.send_message(TELEGRAM_CHAT_ID,
+                            f"{emoji_div} *DIVERGENCIA PRECIO vs DARK POOL*\n"
+                            f"Precio {dir_precio} pero institucionales {dir_dp}\n"
+                            f"🏦 Dark Pool: `{dp_tend}`\n"
+                            f"⚠️ Posible reversión {div_dp.lower()}.",
+                            parse_mode="Markdown")
+                        print(f"  [DIV_DP] {emoji_div} Alerta divergencia {div_dp} enviada")
+                    except Exception as e:
+                        print(f"  [DIV_DP] Error enviando: {e}")
+            except: pass
 
         # ── Regla de apertura ─────────────────────────────────
         if minutos < 5:
