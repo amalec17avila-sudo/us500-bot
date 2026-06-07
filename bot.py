@@ -1428,6 +1428,27 @@ def calcular_score_total(datos, minutos_apertura):
         vix_ratio_historia.append(vix_ratio["ratio"])
         if len(vix_ratio_historia) > 120: vix_ratio_historia.pop(0)
 
+    # ── Peso dinámico del COT ────────────────────────────────
+    # Si COT contradice Dark Pool Y Macro → peso baja de ±2 a ±1
+    # Evita que COT desactualizado (6 días de retraso) domine señales
+    cot_score_raw   = cot["score"]
+    macro_bajista   = "BAJISTA" in contexto_macro.get("impacto", "").upper()
+    macro_alcista   = "ALCISTA" in contexto_macro.get("impacto", "").upper()
+    dp_tendencia    = dark_pool.get("tendencia", "NEUTRAL")
+    dp_bajista      = dp_tendencia in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]
+    dp_alcista      = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
+
+    # COT alcista pero Dark Pool bajista Y Macro bajista → reducir peso
+    if cot_score_raw > 0 and dp_bajista and macro_bajista:
+        cot_score_ajustado = 1
+        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro({contexto_macro.get('impacto','')})")
+    # COT bajista pero Dark Pool alcista Y Macro alcista → reducir peso
+    elif cot_score_raw < 0 and dp_alcista and macro_alcista:
+        cot_score_ajustado = -1
+        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro({contexto_macro.get('impacto','')})")
+    else:
+        cot_score_ajustado = cot_score_raw
+
     componentes = {
         "delta_volumen":   d_vol["score"],
         "absorcion":       absorc["score"],
@@ -1441,7 +1462,7 @@ def calcular_score_total(datos, minutos_apertura):
         "patron_apertura": p_hora["score"] if p_hora["activo"] else 0,
         "posicion_rango":  pos_rango["score"],
         "liquidez":        liquidez["score"],
-        "cot":             cot["score"],
+        "cot":             cot_score_ajustado,
         "mcclellan":       mcclellan["score"],
         "vvix":            vvix["score"],
         "put_call":        put_call["score"],
@@ -1650,6 +1671,14 @@ def necesita_actualizar_macro():
 
 ultimo_evento_procesado = {"tipo": None, "hora": None}
 
+# Estado para penalización post-evento macro
+penalizacion_macro_activa = {
+    "activa":     False,
+    "tipo":       None,
+    "hora_inicio": None,
+    "desviacion": 0,   # % de desviación vs previsión
+}
+
 def detectar_evento_reciente():
     ahora    = hora_ny()
     hora_et  = ahora.hour * 60 + ahora.minute
@@ -1664,10 +1693,38 @@ def detectar_evento_reciente():
     return None
 
 def procesar_macro_post_evento(nombre_evento):
-    global ultimo_evento_procesado
+    """
+    Actualiza macro post-evento. Si hay gran desviación vs previsión
+    activa penalización de 45 minutos en señales de ambas direcciones.
+    """
+    global ultimo_evento_procesado, penalizacion_macro_activa
     print(f"  [POST-EVENTO] Actualizando macro después de {nombre_evento}...")
     actualizar_contexto_macro(enviar_telegram=True)
     ultimo_evento_procesado = {"tipo": nombre_evento, "hora": hora_ny(), "dia": hora_ny().date()}
+
+    # Detectar gran desviación en texto macro
+    macro_texto = (contexto_macro.get("resumen", "") +
+                   " ".join(contexto_macro.get("noticias", []))).lower()
+    sorpresa_keywords = [
+        "superó expectativas", "supera expectativas", "duplica", "triplica",
+        "muy por encima", "muy por debajo", "sorprende", "sorpresa",
+        "vs estimado", "vs esperado", "mayor caída", "mayor subida",
+        "récord", "histórico", "beats", "misses", "dobla", "dobló"
+    ]
+    hay_sorpresa = any(k in macro_texto for k in sorpresa_keywords)
+    if hay_sorpresa:
+        penalizacion_macro_activa.update({
+            "activa": True, "tipo": nombre_evento,
+            "hora_inicio": hora_ny(), "desviacion": 1,
+        })
+        print(f"  [POST-EVENTO] ⚠️ Gran desviación — penalización activa 45 min")
+        try:
+            bot.send_message(TELEGRAM_CHAT_ID,
+                f"⚠️ *POST-{nombre_evento} — SEÑALES PENALIZADAS 45 MIN*\n"
+                f"Gran desviación vs previsión detectada.\n"
+                f"Evita entradas durante los próximos 45 minutos.",
+                parse_mode="Markdown")
+        except: pass
 
 pre_apertura_enviado = {"dia": None}
 
@@ -1925,23 +1982,47 @@ Responde en español en EXACTAMENTE 5 líneas cortas, sin asteriscos, sin títul
 # ================================================================
 
 def detectar_contradiccion_institucional(resultado):
-    detalle  = resultado["detalle"]
-    macro_imp = contexto_macro.get("impacto", "")
-    dp        = detalle.get("dark_pool", {})
-    vix_nivel = detalle.get("vix_nivel", 20)
-    fg        = detalle.get("fear_greed", {})
-    vvix      = detalle.get("vvix", {})
-    pc        = detalle.get("put_call", {})
-    macro_bajista  = "BAJISTA" in macro_imp.upper()
-    dp_acumulando  = dp.get("interpretacion", "") in ["ACUMULACION INSTITUCIONAL OCULTA", "ACUMULACION INSTITUCIONAL"]
-    vix_bajo       = vix_nivel < 18
-    fg_codicia     = fg.get("valor", 50) > 60 if fg.get("disponible") else False
-    vvix_bajo      = vvix.get("score", 0) >= 0 if vvix.get("disponible") else True
-    pc_neutro      = pc.get("ratio", 1.0) < 1.1 if pc.get("disponible") else True
-    señales_alcistas = sum([dp_acumulando, vix_bajo, fg_codicia, vvix_bajo, pc_neutro])
-    return macro_bajista and señales_alcistas >= 4
+    """
+    Detecta contradicciones institucionales en AMBAS direcciones:
+    - ALCISTA: Macro bajista + Dark Pool ACUMULANDO
+    - BAJISTA: Macro alcista + Dark Pool DISTRIBUYENDO
+    - None: sin contradicción
+    """
+    detalle      = resultado["detalle"]
+    macro_imp    = contexto_macro.get("impacto", "")
+    dp           = detalle.get("dark_pool", {})
+    vix_nivel    = detalle.get("vix_nivel", 20)
+    fg           = detalle.get("fear_greed", {})
+    vvix         = detalle.get("vvix", {})
+    pc           = detalle.get("put_call", {})
+    dp_tendencia = dp.get("tendencia", "NEUTRAL")
 
-def enviar_alerta_contradiccion(resultado):
+    macro_bajista    = "BAJISTA" in macro_imp.upper()
+    macro_alcista    = "ALCISTA" in macro_imp.upper()
+    dp_acumulando    = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
+    dp_distribuyendo = dp_tendencia in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]
+
+    # CONTRADICCIÓN ALCISTA: Macro bajista + Dark Pool acumulando
+    if macro_bajista and dp_acumulando:
+        vix_bajo   = vix_nivel < 18
+        fg_codicia = fg.get("valor", 50) > 60 if fg.get("disponible") else False
+        vvix_bajo  = vvix.get("score", 0) >= 0 if vvix.get("disponible") else True
+        pc_neutro  = pc.get("ratio", 1.0) < 1.1 if pc.get("disponible") else True
+        if sum([vix_bajo, fg_codicia, vvix_bajo, pc_neutro]) >= 3:
+            return "ALCISTA"
+
+    # CONTRADICCIÓN BAJISTA: Macro alcista + Dark Pool distribuyendo
+    if macro_alcista and dp_distribuyendo:
+        vix_alto  = vix_nivel > 18
+        fg_miedo  = fg.get("valor", 50) < 45 if fg.get("disponible") else False
+        vvix_alto = vvix.get("score", 0) < 0 if vvix.get("disponible") else False
+        pc_alto   = pc.get("ratio", 1.0) > 1.1 if pc.get("disponible") else False
+        if sum([vix_alto, fg_miedo, vvix_alto, pc_alto]) >= 2:
+            return "BAJISTA"
+
+    return None
+
+def enviar_alerta_contradiccion(resultado, tipo="ALCISTA"):
     detalle   = resultado["detalle"]
     precio    = detalle["precio"]
     gex       = detalle.get("gex", {})
@@ -2258,10 +2339,19 @@ contador_ciclos        = 0
 cooldown               = EstadoCooldown()
 
 def iniciar_polling():
-    try:
-        bot.polling(none_stop=True, interval=2, timeout=20)
-    except Exception as e:
-        print(f"  [POLLING] Error: {e}")
+    """Polling con reconexión automática — se reinicia solo si falla."""
+    intentos = 0
+    while True:
+        try:
+            intentos += 1
+            print(f"  [POLLING] Iniciando (intento #{intentos})...")
+            bot.polling(none_stop=True, interval=2, timeout=20)
+        except Exception as e:
+            print(f"  [POLLING] Error: {e} — reconectando en 15s...")
+            time.sleep(15)
+        except KeyboardInterrupt:
+            print("  [POLLING] Detenido manualmente")
+            break
 
 polling_thread = threading.Thread(target=iniciar_polling, daemon=True)
 polling_thread.start()
@@ -2472,8 +2562,9 @@ while True:
         if contradiccion_cache["dia"] != ahora_dia:
             contradiccion_cache["enviada"] = False
             contradiccion_cache["dia"]     = ahora_dia
-        if not contradiccion_cache["enviada"] and detectar_contradiccion_institucional(resultado):
-            enviar_alerta_contradiccion(resultado)
+        tipo_contradiccion = detectar_contradiccion_institucional(resultado)
+        if not contradiccion_cache["enviada"] and tipo_contradiccion:
+            enviar_alerta_contradiccion(resultado, tipo_contradiccion)
             contradiccion_cache["enviada"] = True
 
         # ── Regla de apertura ─────────────────────────────────
@@ -2486,6 +2577,19 @@ while True:
         elif minutos < 30:
             score = max(-10, min(10, score - 2 if score > 0 else score + 2))
             print(f"  → ⚠️ Apertura temprana ({minutos:.0f} min) — score ajustado a {score}")
+
+        # ── Verificar penalización post-evento macro ─────────
+        if penalizacion_macro_activa["activa"]:
+            mins_pen = (ahora_ny - penalizacion_macro_activa["hora_inicio"]).total_seconds() / 60
+            if mins_pen >= 45:
+                penalizacion_macro_activa["activa"] = False
+                print(f"  [POST-EVENTO] ✅ Penalización levantada ({mins_pen:.0f} min)")
+            else:
+                print(f"  → ⏸ Post-{penalizacion_macro_activa['tipo']} — señales bloqueadas ({mins_pen:.0f}/45 min)")
+                elapsed = time.time() - inicio_ciclo
+                time.sleep(max(0, 60 - elapsed))
+                contador_ciclos += 1
+                continue
 
         # ── Alertas principales ───────────────────────────────
         if rango_estado.get("suspender"):
