@@ -2826,6 +2826,21 @@ while True:
             if ok:
                 print(f"  → 🟢 ALCISTA score={score} ({razon}). Consultando Claude...")
                 analisis = analizar_con_claude(resultado)
+                # ── Verificar si hay sweep reciente alineado ──
+                sweep_reciente = (sweep_cache["ultimo_sweep"] and
+                                  sweep_cache["tipo"] == "CALL" and
+                                  (ahora_ny - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 30)
+                if sweep_reciente:
+                    try:
+                        bot.send_message(TELEGRAM_CHAT_ID,
+                            f"🔥 *CONFIRMACIÓN INSTITUCIONAL ALCISTA*\n"
+                            f"Score +{score}/10 + Sweep CALLS detectado\n"
+                            f"📊 {sweep_cache['contratos']:,} contratos en {sweep_cache['strikes']} strikes\n"
+                            f"⚡ Señal de alta convicción institucional.",
+                            parse_mode="Markdown")
+                        print("  [SWEEP+SCORE] 🔥 Confirmación institucional alcista enviada")
+                    except Exception as e:
+                        print(f"  [SWEEP+SCORE] Error: {e}")
                 enviar_alerta_score(resultado, analisis)
                 cooldown.registrar_alcista(resultado)
                 activar_detector_agotamiento(resultado)
@@ -2837,6 +2852,21 @@ while True:
             if ok:
                 print(f"  → 🔴 BAJISTA score={score} ({razon}). Consultando Claude...")
                 analisis = analizar_con_claude(resultado)
+                # ── Verificar si hay sweep reciente alineado ──
+                sweep_reciente = (sweep_cache["ultimo_sweep"] and
+                                  sweep_cache["tipo"] == "PUT" and
+                                  (ahora_ny - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 30)
+                if sweep_reciente:
+                    try:
+                        bot.send_message(TELEGRAM_CHAT_ID,
+                            f"🔥 *CONFIRMACIÓN INSTITUCIONAL BAJISTA*\n"
+                            f"Score -{abs(score)}/10 + Sweep PUTS detectado\n"
+                            f"📊 {sweep_cache['contratos']:,} contratos en {sweep_cache['strikes']} strikes\n"
+                            f"⚡ Señal de alta convicción institucional.",
+                            parse_mode="Markdown")
+                        print("  [SWEEP+SCORE] 🔥 Confirmación institucional bajista enviada")
+                    except Exception as e:
+                        print(f"  [SWEEP+SCORE] Error: {e}")
                 enviar_alerta_score(resultado, analisis)
                 cooldown.registrar_bajista(resultado)
                 activar_detector_agotamiento(resultado)
