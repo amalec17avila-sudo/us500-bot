@@ -661,6 +661,189 @@ dark_pool_cache = {
     "fuente":               None,
 }
 
+# Estado para Options Sweep Detection via Tradier
+sweep_cache = {
+    "ultimo_sweep":   None,
+    "tipo":           None,   # "CALL" o "PUT"
+    "contratos":      0,
+    "strikes":        0,
+    "prima_total":    0.0,
+    "alerta_enviada": False,
+    "dia":            None,
+}
+
+# Estado para Put/Call ratio semanal via Tradier
+pc_semanal_cache = {
+    "disponible":           False,
+    "ratio_semanal":        1.0,
+    "ultima_actualizacion": None,
+    "sesgo":                "NEUTRAL",
+}
+
+
+def detectar_options_sweep():
+    """
+    Detecta barridos institucionales de opciones SPY via Tradier.
+    Un sweep ocurre cuando se compran/venden muchos contratos en
+    múltiples strikes en pocos segundos — señal de movimiento inminente.
+    Returns: dict con tipo, contratos, strikes, prima_total o None
+    """
+    if not TRADIER_TOKEN:
+        return None
+    try:
+        import urllib.request, json
+        from datetime import datetime
+
+        # Obtener primera expiración (weekly más cercana)
+        url_exp = "https://api.tradier.com/v1/markets/options/expirations?symbol=SPY&includeAllRoots=true"
+        req = urllib.request.Request(url_exp, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}",
+            "Accept": "application/json"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data_exp = json.loads(resp.read().decode())
+
+        expiraciones = data_exp.get("expirations", {}).get("date", [])
+        if not expiraciones:
+            return None
+        if isinstance(expiraciones, str):
+            expiraciones = [expiraciones]
+
+        # Usar solo la expiración más cercana (weekly)
+        exp = expiraciones[0]
+
+        # Obtener cadena de opciones con volumen y OI
+        url_chain = f"https://api.tradier.com/v1/markets/options/chains?symbol=SPY&expiration={exp}&greeks=false"
+        req = urllib.request.Request(url_chain, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}",
+            "Accept": "application/json"
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data_chain = json.loads(resp.read().decode())
+
+        opciones = data_chain.get("options", {}).get("option", [])
+        if not opciones:
+            return None
+
+        spy = yf.Ticker("SPY")
+        precio_spy = spy.fast_info.last_price or 500
+
+        # Analizar calls y puts por separado
+        calls_activos = []
+        puts_activos  = []
+
+        for op in opciones:
+            strike   = float(op.get("strike", 0))
+            volumen  = float(op.get("volume", 0) or 0)
+            oi       = float(op.get("open_interest", 0) or 0)
+            ask      = float(op.get("ask", 0) or 0)
+            tipo     = op.get("option_type", "")
+
+            # Filtrar strikes cercanos al precio (±5%)
+            if abs(strike - precio_spy) / precio_spy > 0.05:
+                continue
+
+            # Volumen anómalo: volumen > 2x el OI promedio O > 500 contratos
+            if volumen > 500 and (oi == 0 or volumen > oi * 0.5):
+                datos_op = {
+                    "strike":    strike,
+                    "volumen":   volumen,
+                    "prima":     ask * volumen * 100,
+                }
+                if tipo == "call":
+                    calls_activos.append(datos_op)
+                elif tipo == "put":
+                    puts_activos.append(datos_op)
+
+        # Detectar sweep: 3+ strikes activos en misma dirección
+        for tipo_sweep, lista in [("CALL", calls_activos), ("PUT", puts_activos)]:
+            if len(lista) >= 3:
+                total_contratos = sum(o["volumen"] for o in lista)
+                total_prima     = sum(o["prima"] for o in lista)
+                if total_contratos >= 1000:  # mínimo 1000 contratos para ser sweep real
+                    return {
+                        "tipo":       tipo_sweep,
+                        "contratos":  int(total_contratos),
+                        "strikes":    len(lista),
+                        "prima":      total_prima,
+                        "expiracion": exp,
+                    }
+        return None
+
+    except Exception as e:
+        print(f"  [SWEEP] Error: {e}")
+        return None
+
+
+def obtener_pc_ratio_semanal():
+    """
+    Obtiene Put/Call ratio de la expiración semanal más cercana via Tradier.
+    Más sensible que el ratio general — refleja posicionamiento intradía real.
+    """
+    if not TRADIER_TOKEN:
+        return
+    try:
+        import urllib.request, json
+
+        url_exp = "https://api.tradier.com/v1/markets/options/expirations?symbol=SPY&includeAllRoots=true"
+        req = urllib.request.Request(url_exp, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}",
+            "Accept": "application/json"
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data_exp = json.loads(resp.read().decode())
+
+        expiraciones = data_exp.get("expirations", {}).get("date", [])
+        if not expiraciones:
+            return
+        if isinstance(expiraciones, str):
+            expiraciones = [expiraciones]
+
+        exp = expiraciones[0]  # Weekly más cercana
+
+        url_chain = f"https://api.tradier.com/v1/markets/options/chains?symbol=SPY&expiration={exp}&greeks=false"
+        req = urllib.request.Request(url_chain, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}",
+            "Accept": "application/json"
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data_chain = json.loads(resp.read().decode())
+
+        opciones = data_chain.get("options", {}).get("option", [])
+        if not opciones:
+            return
+
+        vol_calls = sum(float(o.get("volume", 0) or 0) for o in opciones if o.get("option_type") == "call")
+        vol_puts  = sum(float(o.get("volume", 0) or 0) for o in opciones if o.get("option_type") == "put")
+
+        if vol_calls == 0:
+            return
+
+        ratio = vol_puts / vol_calls
+
+        if ratio > 1.3:
+            sesgo = "BAJISTA_FUERTE"
+        elif ratio > 1.1:
+            sesgo = "BAJISTA_MODERADO"
+        elif ratio < 0.7:
+            sesgo = "ALCISTA_FUERTE"
+        elif ratio < 0.9:
+            sesgo = "ALCISTA_MODERADO"
+        else:
+            sesgo = "NEUTRAL"
+
+        pc_semanal_cache.update({
+            "disponible":           True,
+            "ratio_semanal":        round(ratio, 3),
+            "ultima_actualizacion": hora_ny(),
+            "sesgo":                sesgo,
+            "expiracion":           exp,
+        })
+        print(f"  [PC_SEMANAL] ✅ Ratio weekly {exp}: {ratio:.3f} → {sesgo}")
+
+    except Exception as e:
+        print(f"  [PC_SEMANAL] Error: {e}")
+
 def obtener_dark_pool():
     """
     Dark Pool proxy mejorado con yfinance granular 5min.
@@ -2511,6 +2694,50 @@ while True:
             if mins_desde_dp >= 30:
                 print(f"  [DARK_POOL] ♻️ Recalculando ({mins_desde_dp:.0f} min desde última actualización)...")
                 obtener_dark_pool()
+
+        # ── Put/Call ratio semanal cada 30 minutos ────────────
+        if TRADIER_TOKEN:
+            if (not pc_semanal_cache["ultima_actualizacion"] or
+                (ahora_ny - pc_semanal_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
+                obtener_pc_ratio_semanal()
+
+        # ── Options Sweep Detection cada 5 minutos ────────────
+        if TRADIER_TOKEN and contador_ciclos % 5 == 0:
+            sweep = detectar_options_sweep()
+            if sweep:
+                hoy = ahora_ny.date()
+                # Resetear alerta si es nuevo día
+                if sweep_cache["dia"] != hoy:
+                    sweep_cache["alerta_enviada"] = False
+                    sweep_cache["dia"] = hoy
+                # Solo alertar si es nuevo sweep (distinto tipo o han pasado 30 min)
+                ultimo = sweep_cache["ultimo_sweep"]
+                mins_desde_sweep = (ahora_ny - ultimo).total_seconds() / 60 if ultimo else 9999
+                if not sweep_cache["alerta_enviada"] or mins_desde_sweep >= 30:
+                    sweep_cache.update({
+                        "ultimo_sweep":  ahora_ny,
+                        "tipo":          sweep["tipo"],
+                        "contratos":     sweep["contratos"],
+                        "strikes":       sweep["strikes"],
+                        "prima_total":   sweep["prima"],
+                        "alerta_enviada": True,
+                    })
+                    emoji = "🟢" if sweep["tipo"] == "CALL" else "🔴"
+                    direccion = "ALCISTA" if sweep["tipo"] == "CALL" else "BAJISTA"
+                    try:
+                        bot.send_message(TELEGRAM_CHAT_ID,
+                            f"{emoji} *SWEEP INSTITUCIONAL {sweep['tipo']}S DETECTADO*\n"
+                            f"────────────────────────────\n"
+                            f"📊 Contratos: `{sweep['contratos']:,}`\n"
+                            f"🎯 Strikes barridos: `{sweep['strikes']}`\n"
+                            f"💰 Prima total: `${sweep['prima']:,.0f}`\n"
+                            f"📅 Expiración: `{sweep['expiracion']}`\n"
+                            f"────────────────────────────\n"
+                            f"⚡ Movimiento {direccion} probable en 15-30 min.",
+                            parse_mode="Markdown")
+                        print(f"  [SWEEP] {emoji} Alerta {sweep['tipo']} enviada — {sweep['contratos']} contratos")
+                    except Exception as e:
+                        print(f"  [SWEEP] Error enviando alerta: {e}")
 
         # ── Calcular score ────────────────────────────────────
         resultado = calcular_score_total(datos, minutos)
