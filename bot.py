@@ -910,20 +910,41 @@ def detectar_options_sweep():
                 elif tipo == "put":
                     puts_activos.append(datos_op)
 
-        # Detectar sweep: 3+ strikes activos en misma dirección
-        for tipo_sweep, lista in [("CALL", calls_activos), ("PUT", puts_activos)]:
-            if len(lista) >= 3:
-                total_contratos = sum(o["volumen"] for o in lista)
-                total_prima     = sum(o["prima"] for o in lista)
-                if total_contratos >= 1000:  # mínimo 1000 contratos para ser sweep real
-                    return {
-                        "tipo":       tipo_sweep,
-                        "contratos":  int(total_contratos),
-                        "strikes":    len(lista),
-                        "prima":      total_prima,
-                        "expiracion": exp,
-                    }
-        return None
+        # ── Calcular totales calls y puts ────────────────────
+        total_calls     = sum(o["volumen"] for o in calls_activos) if len(calls_activos) >= 3 else 0
+        total_puts      = sum(o["volumen"] for o in puts_activos)  if len(puts_activos)  >= 3 else 0
+        prima_calls     = sum(o["prima"]   for o in calls_activos) if len(calls_activos) >= 3 else 0
+        prima_puts      = sum(o["prima"]   for o in puts_activos)  if len(puts_activos)  >= 3 else 0
+
+        # Solo retornar si hay sweep real (mínimo 1000 contratos en alguna dirección)
+        hay_sweep_calls = total_calls >= 1000 and len(calls_activos) >= 3
+        hay_sweep_puts  = total_puts  >= 1000 and len(puts_activos)  >= 3
+
+        if not hay_sweep_calls and not hay_sweep_puts:
+            return None
+
+        # Balance neto
+        balance_neto = prima_calls - prima_puts
+        if balance_neto > 0:
+            direccion_neta = "ALCISTA"
+        elif balance_neto < 0:
+            direccion_neta = "BAJISTA"
+        else:
+            direccion_neta = "NEUTRAL"
+
+        return {
+            "tipo":           direccion_neta,
+            "hay_calls":      hay_sweep_calls,
+            "hay_puts":       hay_sweep_puts,
+            "contratos_calls": int(total_calls),
+            "contratos_puts":  int(total_puts),
+            "prima_calls":    prima_calls,
+            "prima_puts":     prima_puts,
+            "balance_neto":   abs(balance_neto),
+            "strikes_calls":  len(calls_activos),
+            "strikes_puts":   len(puts_activos),
+            "expiracion":     exp,
+        }
 
     except Exception as e:
         print(f"  [SWEEP] Error: {e}")
@@ -2017,17 +2038,39 @@ penalizacion_macro_activa = {
     "desviacion": 0,   # % de desviación vs previsión
 }
 
+# Calendario de eventos reales con fecha exacta — se actualiza semanalmente
+EVENTOS_MACRO_REALES = {
+    # Formato: "NOMBRE": ("YYYY-MM-DD", hora_ET_en_minutos)
+    # Actualizar cada semana con el calendario económico real
+    "NFP":  ("2026-06-05", 8*60+30),   # NFP mayo — ya ocurrió
+    "CPI":  ("2026-06-11", 8*60+30),   # CPI mayo — próximo miércoles
+    "FOMC": ("2026-06-17", 14*60+0),   # FOMC junio
+    "PCE":  ("2026-06-27", 8*60+30),   # PCE mayo
+}
+
 def detectar_evento_reciente():
-    ahora    = hora_ny()
-    hora_et  = ahora.hour * 60 + ahora.minute
-    eventos  = {"NFP": 8*60+30, "CPI": 8*60+30, "PCE": 8*60+30,
-                "FED": 14*60+0, "FOMC": 14*60+0, "PIB": 8*60+30}
-    for nombre, hora_evento in eventos.items():
+    """
+    Detecta eventos macro de alto impacto REALES — solo si ocurrieron HOY
+    y en la ventana de tiempo correcta (15-20 min después del evento).
+    Nunca se activa por mencionar "Fed" o "FOMC" en noticias.
+    """
+    ahora   = hora_ny()
+    hoy_str = ahora.strftime("%Y-%m-%d")
+    hora_et = ahora.hour * 60 + ahora.minute
+
+    for nombre, (fecha_str, hora_evento) in EVENTOS_MACRO_REALES.items():
+        # Solo si el evento es HOY
+        if fecha_str != hoy_str:
+            continue
+        # Solo en ventana 15-20 min después del evento
         minutos_desde = hora_et - hora_evento
-        if 15 <= minutos_desde <= 20:
-            if (ultimo_evento_procesado["tipo"] != nombre or
-                ultimo_evento_procesado.get("dia") != ahora.date()):
-                return nombre
+        if not (15 <= minutos_desde <= 20):
+            continue
+        # Solo si no fue procesado ya hoy
+        if (ultimo_evento_procesado["tipo"] == nombre and
+            ultimo_evento_procesado.get("dia") == ahora.date()):
+            continue
+        return nombre
     return None
 
 def procesar_macro_post_evento(nombre_evento):
@@ -2051,18 +2094,22 @@ def procesar_macro_post_evento(nombre_evento):
     ]
     hay_sorpresa = any(k in macro_texto for k in sorpresa_keywords)
     if hay_sorpresa:
-        penalizacion_macro_activa.update({
-            "activa": True, "tipo": nombre_evento,
-            "hora_inicio": hora_ny(), "desviacion": 1,
-        })
-        print(f"  [POST-EVENTO] ⚠️ Gran desviación — penalización activa 45 min")
-        try:
-            bot.send_message(TELEGRAM_CHAT_ID,
-                f"⚠️ *POST-{nombre_evento} — SEÑALES PENALIZADAS 45 MIN*\n"
-                f"Gran desviación vs previsión detectada.\n"
-                f"Evita entradas durante los próximos 45 minutos.",
-                parse_mode="Markdown")
-        except: pass
+        # Solo activar si no está ya activa para evitar spam
+        if not penalizacion_macro_activa["activa"]:
+            penalizacion_macro_activa.update({
+                "activa": True, "tipo": nombre_evento,
+                "hora_inicio": hora_ny(), "desviacion": 1,
+            })
+            print(f"  [POST-EVENTO] ⚠️ Gran desviación — penalización activa 45 min")
+            try:
+                bot.send_message(TELEGRAM_CHAT_ID,
+                    f"⚠️ *POST-{nombre_evento} — SEÑALES PENALIZADAS 45 MIN*\n"
+                    f"Gran desviación vs previsión detectada.\n"
+                    f"Evita entradas durante los próximos 45 minutos.",
+                    parse_mode="Markdown")
+            except: pass
+        else:
+            print(f"  [POST-EVENTO] Penalización ya activa — ignorando duplicado")
 
 pre_apertura_enviado = {"dia": None}
 
@@ -2138,7 +2185,7 @@ def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (9 * 60 <= hora_et <= 9 * 60 + 45): return
+    if not (9 * 60 <= hora_et <= 9 * 60 + 15): return
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
@@ -2968,27 +3015,38 @@ while True:
                 mins_desde_sweep = (ahora_ny - ultimo).total_seconds() / 60 if ultimo else 9999
                 if not sweep_cache["alerta_enviada"] or mins_desde_sweep >= 30:
                     sweep_cache.update({
-                        "ultimo_sweep":  ahora_ny,
-                        "tipo":          sweep["tipo"],
-                        "contratos":     sweep["contratos"],
-                        "strikes":       sweep["strikes"],
-                        "prima_total":   sweep["prima"],
-                        "alerta_enviada": True,
+                        "ultimo_sweep":    ahora_ny,
+                        "tipo":            sweep["tipo"],
+                        "contratos_calls": sweep.get("contratos_calls", 0),
+                        "contratos_puts":  sweep.get("contratos_puts", 0),
+                        "prima_total":     sweep["balance_neto"],
+                        "strikes":         max(sweep.get("strikes_calls", 0), sweep.get("strikes_puts", 0)),
+                        "alerta_enviada":  True,
                     })
-                    emoji = "🟢" if sweep["tipo"] == "CALL" else "🔴"
-                    direccion = "ALCISTA" if sweep["tipo"] == "CALL" else "BAJISTA"
+                    direccion = sweep["tipo"]
+                    emoji = "🟢" if direccion == "ALCISTA" else ("🔴" if direccion == "BAJISTA" else "⚪")
+                    
+                    # Construir mensaje con ambos lados
+                    calls_txt = ""
+                    puts_txt  = ""
+                    if sweep["hay_calls"]:
+                        calls_txt = (f"🟢 CALLS: `{sweep['contratos_calls']:,}` contratos "
+                                    f"({sweep['strikes_calls']} strikes) — `${sweep['prima_calls']:,.0f}`\n")
+                    if sweep["hay_puts"]:
+                        puts_txt  = (f"🔴 PUTS: `{sweep['contratos_puts']:,}` contratos "
+                                    f"({sweep['strikes_puts']} strikes) — `${sweep['prima_puts']:,.0f}`\n")
+
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
-                            f"{emoji} *SWEEP INSTITUCIONAL {sweep['tipo']}S DETECTADO*\n"
+                            f"{emoji} *SWEEP INSTITUCIONAL DETECTADO*\n"
                             f"────────────────────────────\n"
-                            f"📊 Contratos: `{sweep['contratos']:,}`\n"
-                            f"🎯 Strikes barridos: `{sweep['strikes']}`\n"
-                            f"💰 Prima total: `${sweep['prima']:,.0f}`\n"
+                            f"{calls_txt}{puts_txt}"
+                            f"────────────────────────────\n"
+                            f"📊 Balance neto: *{direccion}* `${sweep['balance_neto']:,.0f}`\n"
                             f"📅 Expiración: `{sweep['expiracion']}`\n"
-                            f"────────────────────────────\n"
                             f"⚡ Movimiento {direccion} probable en 15-30 min.",
                             parse_mode="Markdown")
-                        print(f"  [SWEEP] {emoji} Alerta {sweep['tipo']} enviada — {sweep['contratos']} contratos")
+                        print(f"  [SWEEP] {emoji} Alerta {direccion} enviada — balance ${sweep['balance_neto']:,.0f}")
                     except Exception as e:
                         print(f"  [SWEEP] Error enviando alerta: {e}")
 
@@ -3102,14 +3160,15 @@ while True:
                 analisis = analizar_con_claude(resultado)
                 # ── Verificar si hay sweep reciente alineado ──
                 sweep_reciente = (sweep_cache["ultimo_sweep"] and
-                                  sweep_cache["tipo"] == "CALL" and
+                                  sweep_cache["tipo"] == "ALCISTA" and
                                   (ahora_ny - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 30)
                 if sweep_reciente:
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"🔥 *CONFIRMACIÓN INSTITUCIONAL ALCISTA*\n"
-                            f"Score +{score}/10 + Sweep CALLS detectado\n"
-                            f"📊 {sweep_cache['contratos']:,} contratos en {sweep_cache['strikes']} strikes\n"
+                            f"Score +{score}/10 + Sweep ALCISTA detectado\n"
+                            f"📊 {sweep_cache['contratos_calls']:,} calls vs {sweep_cache['contratos_puts']:,} puts\n"
+                            f"💰 Balance neto: `${sweep_cache['prima_total']:,.0f}`\n"
                             f"⚡ Señal de alta convicción institucional.",
                             parse_mode="Markdown")
                         print("  [SWEEP+SCORE] 🔥 Confirmación institucional alcista enviada")
@@ -3128,14 +3187,15 @@ while True:
                 analisis = analizar_con_claude(resultado)
                 # ── Verificar si hay sweep reciente alineado ──
                 sweep_reciente = (sweep_cache["ultimo_sweep"] and
-                                  sweep_cache["tipo"] == "PUT" and
+                                  sweep_cache["tipo"] == "BAJISTA" and
                                   (ahora_ny - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 30)
                 if sweep_reciente:
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"🔥 *CONFIRMACIÓN INSTITUCIONAL BAJISTA*\n"
-                            f"Score -{abs(score)}/10 + Sweep PUTS detectado\n"
-                            f"📊 {sweep_cache['contratos']:,} contratos en {sweep_cache['strikes']} strikes\n"
+                            f"Score -{abs(score)}/10 + Sweep BAJISTA detectado\n"
+                            f"📊 {sweep_cache['contratos_puts']:,} puts vs {sweep_cache['contratos_calls']:,} calls\n"
+                            f"💰 Balance neto: `${sweep_cache['prima_total']:,.0f}`\n"
                             f"⚡ Señal de alta convicción institucional.",
                             parse_mode="Markdown")
                         print("  [SWEEP+SCORE] 🔥 Confirmación institucional bajista enviada")
