@@ -1,0 +1,36 @@
+name: CME ES Open Interest Daily
+
+on:
+  schedule:
+    # Corre lunes-viernes a las 5:30 PM ET (23:30 UTC)
+    - cron: '30 23 * * 1-5'
+  workflow_dispatch:  # También se puede correr manualmente
+
+jobs:
+  fetch_oi:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GH_PAT }}
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests pdfplumber
+
+      - name: Fetch CME ES Open Interest
+        run: python scripts/fetch_cme_oi.py
+
+      - name: Commit and push data
+        run: |
+          git config --global user.name "CME OI Bot"
+          git config --global user.email "bot@github.com"
+          git add data/es_oi.json
+          git diff --staged --quiet || git commit -m "Update ES OI data $(date +%Y-%m-%d)"
+          git push
