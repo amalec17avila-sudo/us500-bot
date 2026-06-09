@@ -4,7 +4,10 @@ on:
   schedule:
     # Corre lunes-viernes a las 5:30 PM ET (23:30 UTC)
     - cron: '30 23 * * 1-5'
-  workflow_dispatch:  # También se puede correr manualmente
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   fetch_oi:
@@ -15,6 +18,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           token: ${{ secrets.GH_PAT }}
+          persist-credentials: true
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -31,6 +35,7 @@ jobs:
         run: |
           git config --global user.name "CME OI Bot"
           git config --global user.email "bot@github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GH_PAT }}@github.com/${{ github.repository }}
           git add data/es_oi.json
           git diff --staged --quiet || git commit -m "Update ES OI data $(date +%Y-%m-%d)"
           git push
