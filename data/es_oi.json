@@ -1,14 +1,14 @@
 {
-  "oi_actual": 0,
-  "cambio_diario": 0,
-  "cambio_semanal": 0,
+  "oi_actual": 1858691,
+  "cambio_diario": -3075,
+  "cambio_semanal": -3075,
   "fecha": "2026-06-09",
-  "error": "OI inv\u00e1lido: None",
+  "ultima_actualizacion": "2026-06-09T19:22:55.237872",
   "historial": [
     {
       "fecha": "2026-06-09",
-      "oi": 15867,
-      "cambio": -2758
+      "oi": 1858691,
+      "cambio": -3075
     }
   ]
 }
