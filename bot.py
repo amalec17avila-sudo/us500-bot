@@ -303,7 +303,8 @@ def _cot_proxy_fallback():
 # ── CME ES Open Interest desde GitHub ────────────────────────
 # URL del archivo JSON actualizado diariamente por GitHub Actions
 # Reemplaza TU_USUARIO y TU_REPO con los valores reales
-CME_OI_URL = "https://raw.githubusercontent.com/amalec17avila-sudo/us500-bot/main/data/es_oi.json"
+# URL via GitHub API — soportada por Railway
+CME_OI_URL = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/es_oi.json"
 
 cme_oi_cache = {
     "disponible":        False,
@@ -326,10 +327,16 @@ def obtener_cme_oi():
 
         req = urllib.request.Request(CME_OI_URL, headers={
             "User-Agent": "Mozilla/5.0",
+            "Accept": "application/vnd.github.v3+json",
             "Cache-Control": "no-cache",
         })
         with urllib.request.urlopen(req, timeout=10) as resp:
-            datos = json.loads(resp.read().decode())
+            api_response = json.loads(resp.read().decode())
+        # GitHub API devuelve el contenido en base64
+        import base64
+        content_b64 = api_response.get("content", "")
+        content_decoded = base64.b64decode(content_b64).decode('utf-8')
+        datos = json.loads(content_decoded)
 
         oi_actual      = datos.get("oi_actual", 0)
         cambio_diario  = datos.get("cambio_diario", 0)
@@ -2239,6 +2246,28 @@ def calcular_score_total(datos, minutos_apertura):
         elif score_raw < 0 and distancia_desde_maximo > 30: penalizacion_rally =  2
     except: pass
     score_raw += penalizacion_rally
+
+    # ── Penalización por sweep masivo ────────────────────────
+    # Sweep bajista > $500M → limitar score alcista
+    # Sweep alcista > $500M → limitar score bajista
+    penalizacion_sweep = 0
+    UMBRAL_SWEEP = 500_000_000  # $500M
+    try:
+        if sweep_cache.get("ultimo_sweep"):
+            mins_sw  = (hora_ny() - sweep_cache["ultimo_sweep"]).total_seconds() / 60
+            prima_sw = sweep_cache.get("prima_total", 0)
+            tipo_sw  = sweep_cache.get("tipo", "NEUTRAL")
+            if mins_sw <= 60 and prima_sw >= UMBRAL_SWEEP:
+                niveles = int(prima_sw / UMBRAL_SWEEP)  # 1 nivel por cada $500M
+                if tipo_sw == "BAJISTA" and score_raw > 0:
+                    penalizacion_sweep = -min(score_raw, niveles * 2)
+                    print(f"  [SWEEP_PEN] 🔴 ${prima_sw/1e6:.0f}M bajista → score {score_raw}{penalizacion_sweep:+d}")
+                elif tipo_sw == "ALCISTA" and score_raw < 0:
+                    penalizacion_sweep = min(abs(score_raw), niveles * 2)
+                    print(f"  [SWEEP_PEN] 🟢 ${prima_sw/1e6:.0f}M alcista → score {score_raw}+{penalizacion_sweep}")
+    except: pass
+    score_raw += penalizacion_sweep
+
     score_final = max(-10, min(10, score_raw))
 
     return {
