@@ -165,6 +165,46 @@ cot_cache = {
     "fecha_reporte":        None,
 }
 
+# ── COT Estimado — módulo experimental ───────────────────────
+# Lógica:
+# 1. El viernes llega el COT real (datos del martes anterior)
+# 2. Desde ese viernes acumulamos señales miércoles→martes siguiente
+# 3. El próximo viernes comparamos nuestro estimado vs el nuevo COT real
+# Ejemplo: COT real viernes 13 jun (datos martes 9 jun)
+#          → estimamos cambio miérc 10 → martes 16 jun
+#          → validamos el viernes 20 jun
+
+cot_estimado_cache = {
+    "disponible":           False,
+    "cot_base":             0,       # COT real de la semana anterior (punto de partida)
+    "cambio_estimado":      0,       # Cambio estimado para la semana actual
+    "neto_estimado":        0,       # cot_base + cambio_estimado
+    "sesgo":                "NEUTRAL",
+    "confianza":            0.0,     # 0.0-1.0 según historial de precisión
+    "componentes": {
+        "sweep":            0,
+        "dark_pool":        0,
+        "rotacion":         0,
+        "pc_semanal":       0,
+    },
+    "historial_error":      [],      # % error últimas 4 semanas
+    "semana_estimando":     None,    # Semana ISO que estamos estimando
+    "fecha_inicio":         None,    # Miércoles desde cuando acumulamos
+    "ultima_actualizacion": None,
+}
+
+# Acumulador de señales desde el miércoles post-COT
+cot_senales_semana = {
+    "sweep_prima_calls":  0.0,
+    "sweep_prima_puts":   0.0,
+    "dp_dias_alcista":    0,
+    "dp_dias_bajista":    0,
+    "pc_ratios":          [],
+    "dias_acumulados":    0,
+    "semana":             None,    # Semana ISO que estamos acumulando
+    "fecha_inicio":       None,    # Primer día de acumulación
+}
+
 def obtener_cot_report():
     """
     Descarga el COT Report REAL de la CFTC para E-mini S&P 500.
@@ -257,6 +297,295 @@ def _cot_proxy_fallback():
         print(f"  [COT] Proxy error: {e}")
         cot_cache["disponible"] = False
         return False
+
+
+
+# ── CME ES Open Interest desde GitHub ────────────────────────
+# URL del archivo JSON actualizado diariamente por GitHub Actions
+# Reemplaza TU_USUARIO y TU_REPO con los valores reales
+CME_OI_URL = "https://raw.githubusercontent.com/amalec17avila-sudo/us500-bot/main/data/es_oi.json"
+
+cme_oi_cache = {
+    "disponible":        False,
+    "oi_actual":         0,
+    "cambio_diario":     0,
+    "cambio_semanal":    0,
+    "fecha":             None,
+    "ultima_actualizacion": None,
+}
+
+def obtener_cme_oi():
+    """
+    Lee el Open Interest diario de E-Mini S&P 500 desde GitHub.
+    El archivo es actualizado automáticamente cada día al cierre
+    por el workflow de GitHub Actions.
+    """
+    global cme_oi_cache
+    try:
+        import urllib.request, json
+
+        req = urllib.request.Request(CME_OI_URL, headers={
+            "User-Agent": "Mozilla/5.0",
+            "Cache-Control": "no-cache",
+        })
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            datos = json.loads(resp.read().decode())
+
+        oi_actual      = datos.get("oi_actual", 0)
+        cambio_diario  = datos.get("cambio_diario", 0)
+        cambio_semanal = datos.get("cambio_semanal", 0)
+        fecha          = datos.get("fecha", "N/D")
+
+        if oi_actual > 0:
+            cme_oi_cache.update({
+                "disponible":        True,
+                "oi_actual":         oi_actual,
+                "cambio_diario":     cambio_diario,
+                "cambio_semanal":    cambio_semanal,
+                "fecha":             fecha,
+                "ultima_actualizacion": hora_ny(),
+            })
+            print(f"  [CME_OI] ✅ ES OI: {oi_actual:,} | "
+                  f"Diario: {cambio_diario:+,} | Semanal: {cambio_semanal:+,} ({fecha})")
+        else:
+            print("  [CME_OI] ⚠️ OI=0 en el archivo")
+
+    except Exception as e:
+        print(f"  [CME_OI] Error: {e}")
+
+def iniciar_acumulacion_cot():
+    """
+    Se llama cada viernes cuando llega el nuevo COT real.
+    Guarda el COT real como base e inicia acumulación para la semana siguiente.
+    Miércoles de esta semana → martes de la próxima = datos del próximo COT.
+    """
+    global cot_senales_semana, cot_estimado_cache
+
+    if not cot_cache["disponible"] or not cot_cache["neto_largo"]:
+        return
+
+    ahora  = hora_ny()
+    semana = ahora.isocalendar()[1]
+
+    # Guardar el COT real como nuevo punto de partida
+    cot_estimado_cache["cot_base"]          = cot_cache["neto_largo"]
+    cot_estimado_cache["semana_estimando"]  = semana + 1  # Estimamos la SIGUIENTE semana
+    cot_estimado_cache["fecha_inicio"]      = ahora.date()
+    cot_estimado_cache["cambio_estimado"]   = 0
+    cot_estimado_cache["neto_estimado"]     = cot_cache["neto_largo"]
+    cot_estimado_cache["disponible"]        = True
+
+    # Resetear acumulador para la nueva semana
+    cot_senales_semana.update({
+        "sweep_prima_calls": 0.0,
+        "sweep_prima_puts":  0.0,
+        "dp_dias_alcista":   0,
+        "dp_dias_bajista":   0,
+        "pc_ratios":         [],
+        "dias_acumulados":   0,
+        "semana":            semana + 1,
+        "fecha_inicio":      ahora.date(),
+    })
+
+    print(f"  [COT_EST] 🚀 Iniciando estimación semana {semana+1} — base: {cot_cache['neto_largo']:+,}")
+
+
+def acumular_senales_cot():
+    """
+    Acumula señales diarias para el COT estimado.
+    Se llama al cambio de día (lunes-viernes).
+    Solo acumula si hay una estimación activa iniciada el viernes anterior.
+    """
+    global cot_senales_semana
+
+    if not cot_estimado_cache["disponible"]:
+        return
+    if not cot_senales_semana["fecha_inicio"]:
+        return
+
+    ahora = hora_ny()
+
+    # Acumular sweep neto del día (prima calls vs puts)
+    if sweep_cache.get("ultimo_sweep") and sweep_cache["ultimo_sweep"].date() == ahora.date():
+        prima_calls_hoy = sweep_cache.get("prima_calls_hoy", 0)
+        prima_puts_hoy  = sweep_cache.get("prima_puts_hoy", 0)
+        cot_senales_semana["sweep_prima_calls"] += prima_calls_hoy
+        cot_senales_semana["sweep_prima_puts"]  += prima_puts_hoy
+
+    # Acumular tendencia Dark Pool del día
+    if dark_pool_cache["disponible"]:
+        tend = dark_pool_cache.get("tendencia", "NEUTRAL")
+        if tend in ["ACUMULANDO", "MOMENTUM_ALCISTA"]:
+            cot_senales_semana["dp_dias_alcista"] += 1
+        elif tend in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]:
+            cot_senales_semana["dp_dias_bajista"] += 1
+
+    # Acumular PC ratio del día
+    if pc_semanal_cache["disponible"]:
+        cot_senales_semana["pc_ratios"].append(pc_semanal_cache["ratio_semanal"])
+
+    cot_senales_semana["dias_acumulados"] += 1
+
+    print(f"  [COT_EST] 📅 Día {cot_senales_semana['dias_acumulados']} acumulado — "
+          f"Calls: ${cot_senales_semana['sweep_prima_calls']:,.0f} | "
+          f"Puts: ${cot_senales_semana['sweep_prima_puts']:,.0f} | "
+          f"DP: +{cot_senales_semana['dp_dias_alcista']}d/-{cot_senales_semana['dp_dias_bajista']}d")
+
+    # Actualizar el estimado con los datos acumulados
+    actualizar_cot_estimado()
+
+
+def actualizar_cot_estimado():
+    """
+    Recalcula el COT estimado cada 30 minutos usando señales acumuladas.
+    Fórmula: CAMBIO_ESTIMADO = ajuste_sweep + ajuste_dp + ajuste_pc + ajuste_rotacion
+             COT_ESTIMADO    = COT_BASE + CAMBIO_ESTIMADO
+    """
+    global cot_estimado_cache
+
+    if not cot_estimado_cache["disponible"]:
+        return
+    if not cot_cache["disponible"] or not cot_cache["neto_largo"]:
+        return
+
+    cot_base = cot_estimado_cache["cot_base"]
+
+    # ── 1. Ajuste por Sweep neto acumulado ───────────────────
+    # $100M neto en calls ≈ +50K contratos institucionales comprando
+    # $100M neto en puts  ≈ -50K contratos institucionales vendiendo
+    sweep_balance = (cot_senales_semana["sweep_prima_calls"] -
+                     cot_senales_semana["sweep_prima_puts"])
+    ajuste_sweep  = int(sweep_balance / 100_000_000 * 50_000)
+
+    # ── 2. Ajuste por Dark Pool sostenido ────────────────────
+    # Cada día alcista ≈ +25K contratos, cada día bajista ≈ -25K
+    dias_dp   = cot_senales_semana["dp_dias_alcista"] - cot_senales_semana["dp_dias_bajista"]
+    ajuste_dp = dias_dp * 25_000
+
+    # ── 3. Ajuste por Put/Call ratio promedio ─────────────────
+    ajuste_pc = 0
+    if cot_senales_semana["pc_ratios"]:
+        pc_promedio = sum(cot_senales_semana["pc_ratios"]) / len(cot_senales_semana["pc_ratios"])
+        if pc_promedio < 0.8:
+            ajuste_pc = int((0.8 - pc_promedio) * 150_000)
+        elif pc_promedio > 1.2:
+            ajuste_pc = -int((pc_promedio - 1.2) * 150_000)
+
+    # ── 4. Ajuste por CME OI real (si disponible) o SPY/SHY ──
+    ajuste_rotacion = 0
+    if cme_oi_cache["disponible"] and cme_oi_cache["cambio_semanal"] != 0:
+        # Usar cambio semanal real del OI de /ES — dato directo del CME
+        # OI sube → institucionales abriendo largos → ajuste positivo
+        # OI baja → institucionales cerrando o abriendo cortos → ajuste negativo
+        cambio_oi_semana = cme_oi_cache["cambio_semanal"]
+        ajuste_rotacion  = int(cambio_oi_semana * 0.5)  # 50% del cambio real como ajuste
+        print(f"  [COT_EST] CME OI semanal: {cambio_oi_semana:+,} → ajuste rotación: {ajuste_rotacion:+,}")
+    else:
+        # Fallback: SPY/SHY rotation
+        try:
+            spy_data = yf.download("SPY", period="5d", interval="1d", progress=False)
+            shy_data = yf.download("SHY", period="5d", interval="1d", progress=False)
+            if not spy_data.empty and not shy_data.empty:
+                spy_close = spy_data["Close"].squeeze()
+                shy_close = shy_data["Close"].squeeze()
+                spy_ret   = float((spy_close.iloc[-1] / spy_close.iloc[0] - 1) * 100)
+                shy_ret   = float((shy_close.iloc[-1] / shy_close.iloc[0] - 1) * 100)
+                diferencia = spy_ret - shy_ret
+                if abs(diferencia) > 2:
+                    ajuste_rotacion = int(diferencia * 20_000)
+        except: pass
+
+    # ── Calcular cambio y COT estimado ───────────────────────
+    cambio_estimado = ajuste_sweep + ajuste_dp + ajuste_pc + ajuste_rotacion
+    neto_estimado   = cot_base + cambio_estimado
+
+    # ── Confianza basada en historial ─────────────────────────
+    historial = cot_estimado_cache["historial_error"]
+    if len(historial) >= 2:
+        error_prom = sum(abs(e) for e in historial) / len(historial)
+        confianza  = max(0.0, min(1.0, 1.0 - (error_prom / 10.0)))
+    elif len(historial) == 1:
+        confianza = 0.3
+    else:
+        confianza = 0.1  # Sin historial aún
+
+    # ── Sesgo estimado ───────────────────────────────────────
+    umbral = 500_000
+    if neto_estimado > umbral * 2:   sesgo_est = "ALCISTA_FUERTE"
+    elif neto_estimado > umbral:     sesgo_est = "ALCISTA_MODERADO"
+    elif neto_estimado < -umbral*2:  sesgo_est = "BAJISTA_FUERTE"
+    elif neto_estimado < -umbral:    sesgo_est = "BAJISTA_MODERADO"
+    else:                            sesgo_est = "NEUTRAL"
+
+    dias_acc = cot_senales_semana["dias_acumulados"]
+    cot_estimado_cache.update({
+        "cambio_estimado":      cambio_estimado,
+        "neto_estimado":        neto_estimado,
+        "sesgo":                sesgo_est,
+        "confianza":            confianza,
+        "componentes": {
+            "sweep":     ajuste_sweep,
+            "dark_pool": ajuste_dp,
+            "rotacion":  ajuste_rotacion,
+            "pc_semanal":ajuste_pc,
+        },
+        "ultima_actualizacion": hora_ny(),
+    })
+
+    print(f"  [COT_EST] 📊 Base:{cot_base:+,} | Cambio:{cambio_estimado:+,} | "
+          f"Estimado:{neto_estimado:+,} | Días:{dias_acc} | Confianza:{confianza:.0%}")
+
+
+def validar_cot_estimado_vs_real():
+    """
+    Se llama cada viernes cuando llega el nuevo COT real.
+    Compara el estimado de la semana que terminó vs el real publicado.
+    """
+    global cot_estimado_cache
+
+    if not cot_estimado_cache["disponible"]:
+        return
+    if not cot_cache["disponible"] or not cot_cache["neto_largo"]:
+        return
+
+    # El cambio real = COT nuevo - COT base que usamos
+    cot_nuevo    = cot_cache["neto_largo"]
+    cot_base     = cot_estimado_cache["cot_base"]
+    cambio_real  = cot_nuevo - cot_base
+    cambio_est   = cot_estimado_cache["cambio_estimado"]
+    dias_acc     = cot_senales_semana["dias_acumulados"]
+
+    if cot_base == 0:
+        return
+
+    # Error relativo al COT base
+    error_pct = abs((cambio_est - cambio_real) / abs(cot_base) * 100) if cot_base != 0 else 100
+    precision = "✅ BUENA" if error_pct <= 3 else ("⚠️ ACEPTABLE" if error_pct <= 7 else "❌ MEJORAR")
+
+    historial = cot_estimado_cache["historial_error"]
+    historial.append(error_pct)
+    if len(historial) > 4:
+        historial.pop(0)
+
+    print(f"  [COT_EST] 🎯 Validación: Base={cot_base:+,} | "
+          f"Cambio estimado={cambio_est:+,} | Cambio real={cambio_real:+,} | "
+          f"Error={error_pct:.1f}% {precision}")
+
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID,
+            f"🎯 *VALIDACIÓN COT ESTIMADO — Semana {cot_estimado_cache['semana_estimando']}*\n"
+            f"────────────────────────────\n"
+            f"📊 COT base (semana ant): `{cot_base:+,}`\n"
+            f"📈 Cambio estimado: `{cambio_est:+,}` ({dias_acc} días acumulados)\n"
+            f"📈 Cambio real CFTC: `{cambio_real:+,}`\n"
+            f"📐 Error: `{error_pct:.1f}%` {precision}\n"
+            f"────────────────────────────\n"
+            f"{'✅ Modelo confiable — usar en trading' if error_pct <= 3 else '⚠️ Semana ' + str(len(historial)) + '/4 — calibrando...'}",
+            parse_mode="Markdown")
+    except: pass
+
+    # Iniciar acumulación para la próxima semana con el nuevo COT como base
+    iniciar_acumulacion_cot()
 
 def evaluar_cot():
     if not cot_cache["disponible"]:
@@ -2277,7 +2606,7 @@ def enviar_pre_apertura():
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
                f"⏰ Mercado abre en ~15 minutos\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
-               f"📊 {cot_texto}\n"
+               f"📊 {cot_texto}{cot_est_texto}\n"
                f"🌡️ {fg_texto}\n"
                f"📉 {breadth_texto}\n"
                f"🌍 Macro: `{macro_imp}`"
@@ -2345,6 +2674,14 @@ def enviar_resumen_dominical():
         if len(msg) > 4096: msg = msg[:4090] + "..."
         bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         resumen_dominical_enviado["semana"] = semana_actual
+        # Validar COT estimado vs real e iniciar nueva semana
+        try:
+            if cot_estimado_cache["disponible"]:
+                validar_cot_estimado_vs_real()  # valida Y llama iniciar_acumulacion_cot
+            else:
+                iniciar_acumulacion_cot()  # Primera vez — solo iniciar
+        except Exception as e:
+            print(f"  [COT_EST] Error validando/iniciando: {e}")
         print("  [DOMINICAL] ✅ Resumen enviado")
     except Exception as e:
         print(f"  [DOMINICAL] Error: {e}")
@@ -3021,6 +3358,17 @@ while True:
                 (ahora_ny - pc_semanal_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
                 obtener_pc_ratio_semanal()
 
+        # ── CME OI — actualizar cada 60 minutos ──────────────
+        if (not cme_oi_cache["ultima_actualizacion"] or
+            (ahora_ny - cme_oi_cache["ultima_actualizacion"]).total_seconds() / 60 >= 60):
+            obtener_cme_oi()
+
+        # ── COT Estimado — actualizar cada 30 minutos ─────────
+        if cot_cache["disponible"]:
+            if (not cot_estimado_cache["ultima_actualizacion"] or
+                (ahora_ny - cot_estimado_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
+                actualizar_cot_estimado()
+
         # ── Alertas proximidad GEX ───────────────────────────
         if gex_niveles["disponible"] and datos:
             try:
@@ -3134,6 +3482,11 @@ while True:
         if contradiccion_cache["dia"] != ahora_dia:
             contradiccion_cache["enviada"] = False
             contradiccion_cache["dia"]     = ahora_dia
+            # Acumular señales del día para COT estimado
+            try:
+                acumular_senales_cot()
+            except Exception as e:
+                print(f"  [COT_EST] Error acumulando: {e}")
         tipo_contradiccion = detectar_contradiccion_institucional(resultado)
         if not contradiccion_cache["enviada"] and tipo_contradiccion:
             enviar_alerta_contradiccion(resultado, tipo_contradiccion)
