@@ -2099,21 +2099,31 @@ def calcular_score_total(datos, minutos_apertura):
                 else: break
         except: pass
 
-    # precio_actual: SPY ya viene escalado x10 en descargar_datos
-    # Si es 0 usar fast_info como fallback
-    precio_raw    = float(spy.iloc[-1])
-    if precio_raw > 100:  # Ya está en escala US500 (7000+)
-        precio_actual = precio_raw
-    elif precio_raw > 0:  # Está en escala SPY (700+) — multiplicar
-        precio_actual = precio_raw * 10
-    else:
-        # Fallback a fast_info
+    # precio_actual: usar ^GSPC directamente (ya en escala US500)
+    precio_actual = 0.0
+    try:
+        gspc_series = datos["close"]["^GSPC"]
+        # Filtrar valores 0 y tomar el último válido
+        gspc_valid = gspc_series[gspc_series > 100]
+        if not gspc_valid.empty:
+            precio_actual = float(gspc_valid.iloc[-1])
+    except: pass
+
+    # Fallback: SPY × 10
+    if precio_actual < 100:
+        try:
+            spy_series = datos["close"].get("SPY", spy)
+            spy_valid = spy_series[spy_series > 100] if hasattr(spy_series, '__iter__') else spy_series
+            precio_actual = float(spy_valid.iloc[-1]) * 10 if not spy_valid.empty else 0
+        except: pass
+
+    # Último fallback: fast_info
+    if precio_actual < 100:
         try:
             import yfinance as _yf
-            _t = _yf.Ticker("SPY")
-            precio_actual = (_t.fast_info.last_price or 750) * 10
+            precio_actual = (_yf.Ticker("^GSPC").fast_info.last_price or 7400)
         except:
-            precio_actual = 7500  # Valor de emergencia
+            precio_actual = 7400
     vix_nivel_act = float(vix.iloc[-1])
 
     d_vol      = delta_volumen(spy, open_, volume)
