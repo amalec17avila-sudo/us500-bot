@@ -325,11 +325,16 @@ def obtener_cme_oi():
     try:
         import urllib.request, json
 
-        req = urllib.request.Request(CME_OI_URL, headers={
+        # GitHub API autenticada — 5000 req/hora vs 60 sin auth
+        gh_token = os.environ.get("GH_TOKEN", "")
+        gh_headers = {
             "User-Agent": "Mozilla/5.0",
             "Accept": "application/vnd.github.v3+json",
             "Cache-Control": "no-cache",
-        })
+        }
+        if gh_token:
+            gh_headers["Authorization"] = f"Bearer {gh_token}"
+        req = urllib.request.Request(CME_OI_URL, headers=gh_headers)
         with urllib.request.urlopen(req, timeout=10) as resp:
             api_response = json.loads(resp.read().decode())
         # GitHub API devuelve el contenido en base64
