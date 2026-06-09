@@ -1787,9 +1787,12 @@ def calcular_score_total(datos, minutos_apertura):
         vix_ratio_historia.append(vix_ratio["ratio"])
         if len(vix_ratio_historia) > 120: vix_ratio_historia.pop(0)
 
-    # ── Peso dinámico del COT ────────────────────────────────
-    # Si COT contradice Dark Pool Y Macro → peso baja de ±2 a ±1
-    # Evita que COT desactualizado (6 días de retraso) domine señales
+    # ── Peso dinámico del COT — versión mejorada ────────────
+    # El COT tiene 6 días de retraso — puede no reflejar la realidad actual
+    # Reglas de reducción de peso:
+    # Nivel 1: COT contradice Dark Pool Y Macro → peso baja a ±1
+    # Nivel 2: COT contradice Dark Pool O Macro Y precio va en contra → peso baja a ±1
+    # Nivel 3: COT contradice sweep neto Y precio cae/sube consistentemente → peso baja a 0
     cot_score_raw   = cot["score"]
     macro_bajista   = "BAJISTA" in contexto_macro.get("impacto", "").upper()
     macro_alcista   = "ALCISTA" in contexto_macro.get("impacto", "").upper()
@@ -1797,16 +1800,47 @@ def calcular_score_total(datos, minutos_apertura):
     dp_bajista      = dp_tendencia in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]
     dp_alcista      = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
 
-    # COT alcista pero Dark Pool bajista Y Macro bajista → reducir peso
-    if cot_score_raw > 0 and dp_bajista and macro_bajista:
+    # Verificar dirección del precio vs COT
+    precio_actual   = datos.get("precio_actual", 0) if datos else 0
+    tendencia_score = resultado_tendencia.get("score", 0) if "resultado_tendencia" in dir() else 0
+
+    # Verificar sweep neto si está disponible
+    sweep_bajista_neto = (sweep_cache.get("tipo") == "BAJISTA" and
+                         sweep_cache.get("ultimo_sweep") and
+                         (hora_ny() - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 60)
+    sweep_alcista_neto = (sweep_cache.get("tipo") == "ALCISTA" and
+                         sweep_cache.get("ultimo_sweep") and
+                         (hora_ny() - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 60)
+
+    cot_score_ajustado = cot_score_raw  # Default: peso completo
+
+    # ── Nivel 3: COT alcista + sweep bajista neto + precio cayendo → peso 0
+    if cot_score_raw > 0 and sweep_bajista_neto and dp_bajista:
+        cot_score_ajustado = 0
+        print(f"  [COT] 🚫 Peso eliminado — contradice Sweep BAJISTA + Dark Pool bajista")
+
+    # ── Nivel 3: COT bajista + sweep alcista neto + precio subiendo → peso 0
+    elif cot_score_raw < 0 and sweep_alcista_neto and dp_alcista:
+        cot_score_ajustado = 0
+        print(f"  [COT] 🚫 Peso eliminado — contradice Sweep ALCISTA + Dark Pool alcista")
+
+    # ── Nivel 1: COT contradice Dark Pool Y Macro → peso ±1
+    elif cot_score_raw > 0 and dp_bajista and macro_bajista:
         cot_score_ajustado = 1
-        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro({contexto_macro.get('impacto','')})")
-    # COT bajista pero Dark Pool alcista Y Macro alcista → reducir peso
+        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro bajista")
+
     elif cot_score_raw < 0 and dp_alcista and macro_alcista:
         cot_score_ajustado = -1
-        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro({contexto_macro.get('impacto','')})")
-    else:
-        cot_score_ajustado = cot_score_raw
+        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro alcista")
+
+    # ── Nivel 2: COT contradice Dark Pool O Macro (uno solo) → peso ±1
+    elif cot_score_raw > 0 and (dp_bajista or macro_bajista):
+        cot_score_ajustado = 1
+        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro bajista")
+
+    elif cot_score_raw < 0 and (dp_alcista or macro_alcista):
+        cot_score_ajustado = -1
+        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro alcista")
 
     componentes = {
         "delta_volumen":   d_vol["score"],
