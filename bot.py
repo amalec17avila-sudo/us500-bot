@@ -2087,7 +2087,21 @@ def calcular_score_total(datos, minutos_apertura):
                 else: break
         except: pass
 
-    precio_actual = float(spy.iloc[-1])
+    # precio_actual: SPY ya viene escalado x10 en descargar_datos
+    # Si es 0 usar fast_info como fallback
+    precio_raw    = float(spy.iloc[-1])
+    if precio_raw > 100:  # Ya está en escala US500 (7000+)
+        precio_actual = precio_raw
+    elif precio_raw > 0:  # Está en escala SPY (700+) — multiplicar
+        precio_actual = precio_raw * 10
+    else:
+        # Fallback a fast_info
+        try:
+            import yfinance as _yf
+            _t = _yf.Ticker("SPY")
+            precio_actual = (_t.fast_info.last_price or 750) * 10
+        except:
+            precio_actual = 7500  # Valor de emergencia
     vix_nivel_act = float(vix.iloc[-1])
 
     d_vol      = delta_volumen(spy, open_, volume)
@@ -2548,7 +2562,7 @@ def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (9 * 60 <= hora_et <= 9 * 60 + 15): return
+    if not (9 * 60 <= hora_et <= 9 * 60 + 29): return  # 9:00-9:29 ET
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
