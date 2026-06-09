@@ -2099,31 +2099,45 @@ def calcular_score_total(datos, minutos_apertura):
                 else: break
         except: pass
 
-    # precio_actual: usar ^GSPC directamente (ya en escala US500)
+    # precio_actual: usar ^GSPC con múltiples fallbacks
     precio_actual = 0.0
+
+    # Método 1: ^GSPC desde datos descargados
     try:
-        gspc_series = datos["close"]["^GSPC"]
-        # Filtrar valores 0 y tomar el último válido
-        gspc_valid = gspc_series[gspc_series > 100]
+        gspc_series = datos["close"]["^GSPC"].dropna()
+        gspc_valid  = gspc_series[gspc_series > 1000]  # S&P 500 siempre > 1000
         if not gspc_valid.empty:
             precio_actual = float(gspc_valid.iloc[-1])
-    except: pass
+            print(f"  [PRECIO] ^GSPC: {precio_actual:.2f}")
+    except Exception as e:
+        print(f"  [PRECIO] ^GSPC error: {e}")
 
-    # Fallback: SPY × 10
-    if precio_actual < 100:
-        try:
-            spy_series = datos["close"].get("SPY", spy)
-            spy_valid = spy_series[spy_series > 100] if hasattr(spy_series, '__iter__') else spy_series
-            precio_actual = float(spy_valid.iloc[-1]) * 10 if not spy_valid.empty else 0
-        except: pass
-
-    # Último fallback: fast_info
-    if precio_actual < 100:
+    # Método 2: fast_info del ticker
+    if precio_actual < 1000:
         try:
             import yfinance as _yf
-            precio_actual = (_yf.Ticker("^GSPC").fast_info.last_price or 7400)
-        except:
-            precio_actual = 7400
+            _gspc = _yf.Ticker("^GSPC")
+            precio_actual = float(_gspc.fast_info.last_price or 0)
+            if precio_actual > 1000:
+                print(f"  [PRECIO] fast_info: {precio_actual:.2f}")
+        except Exception as e:
+            print(f"  [PRECIO] fast_info error: {e}")
+
+    # Método 3: SPY × 10 como último recurso
+    if precio_actual < 1000:
+        try:
+            import yfinance as _yf
+            _spy = _yf.Ticker("SPY")
+            spy_price = float(_spy.fast_info.last_price or 0)
+            if spy_price > 100:
+                precio_actual = spy_price * 10
+                print(f"  [PRECIO] SPY×10: {precio_actual:.2f}")
+        except Exception as e:
+            print(f"  [PRECIO] SPY error: {e}")
+
+    if precio_actual < 1000:
+        print(f"  [PRECIO] ⚠️ No se pudo obtener precio válido — usando 0")
+        precio_actual = 0.0
     vix_nivel_act = float(vix.iloc[-1])
 
     d_vol      = delta_volumen(spy, open_, volume)
@@ -2230,6 +2244,7 @@ def calcular_score_total(datos, minutos_apertura):
     }
 
     score_raw = sum(componentes.values())
+    score_raw = max(-10, min(10, score_raw))  # Clamp antes de penalizaciones
 
     penalizacion_rsi = 0
     if score_raw > 0 and val_rsi > 75:   penalizacion_rsi = -2
@@ -2255,10 +2270,12 @@ def calcular_score_total(datos, minutos_apertura):
         max_dia = float(high.iloc[-minutos_apertura:].max()) if minutos_apertura > 0 else float(high.iloc[-30:].max())
         distancia_desde_minimo = precio_actual - min_dia
         distancia_desde_maximo = max_dia - precio_actual
-        if   score_raw > 0 and distancia_desde_minimo > 50: penalizacion_rally = -3
-        elif score_raw > 0 and distancia_desde_minimo > 30: penalizacion_rally = -2
-        elif score_raw < 0 and distancia_desde_maximo > 50: penalizacion_rally =  3
-        elif score_raw < 0 and distancia_desde_maximo > 30: penalizacion_rally =  2
+        # Solo aplicar si precio es válido
+        if precio_actual > 100:
+            if   score_raw > 0 and distancia_desde_minimo > 50: penalizacion_rally = -3
+            elif score_raw > 0 and distancia_desde_minimo > 30: penalizacion_rally = -2
+            elif score_raw < 0 and distancia_desde_maximo > 50: penalizacion_rally =  3
+            elif score_raw < 0 and distancia_desde_maximo > 30: penalizacion_rally =  2
     except: pass
     score_raw += penalizacion_rally
 
