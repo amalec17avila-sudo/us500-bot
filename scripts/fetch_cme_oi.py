@@ -16,7 +16,6 @@ def fetch_pdf_text():
     url = ("https://www.cmegroup.com/daily_bulletin/current/"
            "Section01C_Summary_Volume_And_Open_Interest_Equity_Index_Futures_And_Options.pdf")
     
-    # Múltiples User-Agents para intentar
     user_agents = [
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
@@ -25,7 +24,6 @@ def fetch_pdf_text():
     
     for ua in user_agents:
         try:
-            # Crear contexto SSL que ignora verificación (algunos proxies lo necesitan)
             ctx = ssl.create_default_context()
             
             headers = {
@@ -72,7 +70,6 @@ def fetch_pdf_text():
             import json as json_mod
             data = json_mod.loads(resp.read().decode())
             print(f"✅ API JSON: {data}")
-            # Extraer OI del JSON si está disponible
             if "openInterest" in str(data):
                 return str(data)
     except Exception as e:
@@ -115,13 +112,49 @@ def cargar_historial():
         except: pass
     return {"historial": []}
 
+def calcular_cambio_semanal_cot(historial, oi_actual):
+    """
+    Calcula el cambio semanal respetando la ventana del COT de la CFTC:
+    miércoles → martes de la semana siguiente.
+    
+    Busca el miércoles más reciente en el historial como punto de partida.
+    Si no hay miércoles disponible (primeros días), usa el dato más antiguo disponible.
+    """
+    if not historial:
+        return 0
+
+    # Buscar el miércoles más reciente ANTERIOR al día actual
+    # weekday(): lunes=0, martes=1, miércoles=2, jueves=3, viernes=4
+    # Excluimos el día actual para no usar el miércoles de hoy como base de hoy mismo
+    hoy_str = date.today().isoformat()
+    miercoles_entries = [
+        h for h in historial
+        if datetime.strptime(h["fecha"], "%Y-%m-%d").weekday() == 2  # miércoles
+        and h["fecha"] < hoy_str  # estrictamente anterior a hoy
+    ]
+
+    if miercoles_entries:
+        # Tomar el miércoles más reciente como base
+        miercoles_base = miercoles_entries[-1]
+        cambio = oi_actual - miercoles_base["oi"]
+        print(f"  [COT_VENTANA] Base miércoles {miercoles_base['fecha']}: OI={miercoles_base['oi']:,} → Cambio={cambio:+,}")
+        return cambio
+    else:
+        # Sin miércoles en historial — usar el dato más antiguo disponible
+        oi_base = historial[0]["oi"]
+        cambio = oi_actual - oi_base
+        print(f"  [COT_VENTANA] Sin miércoles — usando base {historial[0]['fecha']}: OI={oi_base:,} → Cambio={cambio:+,}")
+        return cambio
+
 def guardar_datos(oi_actual, cambio):
     hoy = date.today().isoformat()
     datos = cargar_historial()
     historial = [h for h in datos.get("historial", []) if h.get("fecha") != hoy]
     historial.append({"fecha": hoy, "oi": oi_actual, "cambio": cambio})
     historial = sorted(historial, key=lambda x: x["fecha"])[-30:]
-    cambio_semana = oi_actual - historial[-5]["oi"] if len(historial) >= 5 else cambio
+
+    # Cambio semanal respetando ventana miércoles→martes del COT CFTC
+    cambio_semana = calcular_cambio_semanal_cot(historial, oi_actual)
 
     resultado = {
         "oi_actual": oi_actual, "cambio_diario": cambio,
@@ -131,7 +164,7 @@ def guardar_datos(oi_actual, cambio):
     }
     with open(OUTPUT_FILE, 'w') as f:
         json.dump(resultado, f, indent=2)
-    print(f"✅ Guardado: OI={oi_actual:,} | Diario={cambio:+,} | Semanal={cambio_semana:+,}")
+    print(f"✅ Guardado: OI={oi_actual:,} | Diario={cambio:+,} | Semanal(miérc-base)={cambio_semana:+,}")
 
 def main():
     print(f"=== CME ES OI Fetcher — {date.today()} ===")
@@ -147,7 +180,7 @@ def main():
         with open(OUTPUT_FILE, 'w') as f:
             json.dump({
                 "oi_actual": 0, "cambio_diario": 0, "cambio_semanal": 0,
-                "fecha": date.today().isoformat(), "error": f"CME bloqueó acceso",
+                "fecha": date.today().isoformat(), "error": "CME bloqueó acceso",
                 "historial": datos.get("historial", [])
             }, f, indent=2)
 
