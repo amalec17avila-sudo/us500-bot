@@ -303,8 +303,7 @@ def _cot_proxy_fallback():
 # ── CME ES Open Interest desde GitHub ────────────────────────
 # URL del archivo JSON actualizado diariamente por GitHub Actions
 # Reemplaza TU_USUARIO y TU_REPO con los valores reales
-# URL via GitHub API — soportada por Railway
-CME_OI_URL = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/es_oi.json"
+CME_OI_URL = "https://raw.githubusercontent.com/amalec17avila-sudo/us500-bot/main/data/es_oi.json"
 
 cme_oi_cache = {
     "disponible":        False,
@@ -325,23 +324,12 @@ def obtener_cme_oi():
     try:
         import urllib.request, json
 
-        # GitHub API autenticada — 5000 req/hora vs 60 sin auth
-        gh_token = os.environ.get("GH_TOKEN", "")
-        gh_headers = {
+        req = urllib.request.Request(CME_OI_URL, headers={
             "User-Agent": "Mozilla/5.0",
-            "Accept": "application/vnd.github.v3+json",
             "Cache-Control": "no-cache",
-        }
-        if gh_token:
-            gh_headers["Authorization"] = f"Bearer {gh_token}"
-        req = urllib.request.Request(CME_OI_URL, headers=gh_headers)
+        })
         with urllib.request.urlopen(req, timeout=10) as resp:
-            api_response = json.loads(resp.read().decode())
-        # GitHub API devuelve el contenido en base64
-        import base64
-        content_b64 = api_response.get("content", "")
-        content_decoded = base64.b64decode(content_b64).decode('utf-8')
-        datos = json.loads(content_decoded)
+            datos = json.loads(resp.read().decode())
 
         oi_actual      = datos.get("oi_actual", 0)
         cambio_diario  = datos.get("cambio_diario", 0)
@@ -2099,45 +2087,7 @@ def calcular_score_total(datos, minutos_apertura):
                 else: break
         except: pass
 
-    # precio_actual: usar ^GSPC con múltiples fallbacks
-    precio_actual = 0.0
-
-    # Método 1: ^GSPC desde datos descargados
-    try:
-        gspc_series = datos["close"]["^GSPC"].dropna()
-        gspc_valid  = gspc_series[gspc_series > 1000]  # S&P 500 siempre > 1000
-        if not gspc_valid.empty:
-            precio_actual = float(gspc_valid.iloc[-1])
-            print(f"  [PRECIO] ^GSPC: {precio_actual:.2f}")
-    except Exception as e:
-        print(f"  [PRECIO] ^GSPC error: {e}")
-
-    # Método 2: fast_info del ticker
-    if precio_actual < 1000:
-        try:
-            import yfinance as _yf
-            _gspc = _yf.Ticker("^GSPC")
-            precio_actual = float(_gspc.fast_info.last_price or 0)
-            if precio_actual > 1000:
-                print(f"  [PRECIO] fast_info: {precio_actual:.2f}")
-        except Exception as e:
-            print(f"  [PRECIO] fast_info error: {e}")
-
-    # Método 3: SPY × 10 como último recurso
-    if precio_actual < 1000:
-        try:
-            import yfinance as _yf
-            _spy = _yf.Ticker("SPY")
-            spy_price = float(_spy.fast_info.last_price or 0)
-            if spy_price > 100:
-                precio_actual = spy_price * 10
-                print(f"  [PRECIO] SPY×10: {precio_actual:.2f}")
-        except Exception as e:
-            print(f"  [PRECIO] SPY error: {e}")
-
-    if precio_actual < 1000:
-        print(f"  [PRECIO] ⚠️ No se pudo obtener precio válido — usando 0")
-        precio_actual = 0.0
+    precio_actual = float(spy.iloc[-1])
     vix_nivel_act = float(vix.iloc[-1])
 
     d_vol      = delta_volumen(spy, open_, volume)
@@ -2180,7 +2130,7 @@ def calcular_score_total(datos, minutos_apertura):
     dp_alcista      = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
 
     # Verificar dirección del precio vs COT
-    precio_actual   = datos.get("precio_actual", 0) if datos else 0
+    # precio_actual ya calculado arriba — no sobreescribir con datos dict
     tendencia_score = resultado_tendencia.get("score", 0) if "resultado_tendencia" in dir() else 0
 
     # Verificar sweep neto si está disponible
@@ -2244,7 +2194,6 @@ def calcular_score_total(datos, minutos_apertura):
     }
 
     score_raw = sum(componentes.values())
-    score_raw = max(-10, min(10, score_raw))  # Clamp antes de penalizaciones
 
     penalizacion_rsi = 0
     if score_raw > 0 and val_rsi > 75:   penalizacion_rsi = -2
@@ -2270,36 +2219,12 @@ def calcular_score_total(datos, minutos_apertura):
         max_dia = float(high.iloc[-minutos_apertura:].max()) if minutos_apertura > 0 else float(high.iloc[-30:].max())
         distancia_desde_minimo = precio_actual - min_dia
         distancia_desde_maximo = max_dia - precio_actual
-        # Solo aplicar si precio es válido
-        if precio_actual > 100:
-            if   score_raw > 0 and distancia_desde_minimo > 50: penalizacion_rally = -3
-            elif score_raw > 0 and distancia_desde_minimo > 30: penalizacion_rally = -2
-            elif score_raw < 0 and distancia_desde_maximo > 50: penalizacion_rally =  3
-            elif score_raw < 0 and distancia_desde_maximo > 30: penalizacion_rally =  2
+        if   score_raw > 0 and distancia_desde_minimo > 50: penalizacion_rally = -3
+        elif score_raw > 0 and distancia_desde_minimo > 30: penalizacion_rally = -2
+        elif score_raw < 0 and distancia_desde_maximo > 50: penalizacion_rally =  3
+        elif score_raw < 0 and distancia_desde_maximo > 30: penalizacion_rally =  2
     except: pass
     score_raw += penalizacion_rally
-
-    # ── Penalización por sweep masivo ────────────────────────
-    # Sweep bajista > $500M → limitar score alcista
-    # Sweep alcista > $500M → limitar score bajista
-    penalizacion_sweep = 0
-    UMBRAL_SWEEP = 500_000_000  # $500M
-    try:
-        if sweep_cache.get("ultimo_sweep"):
-            mins_sw  = (hora_ny() - sweep_cache["ultimo_sweep"]).total_seconds() / 60
-            prima_sw = sweep_cache.get("prima_total", 0)
-            tipo_sw  = sweep_cache.get("tipo", "NEUTRAL")
-            if mins_sw <= 60 and prima_sw >= UMBRAL_SWEEP:
-                niveles = int(prima_sw / UMBRAL_SWEEP)  # 1 nivel por cada $500M
-                if tipo_sw == "BAJISTA" and score_raw > 0:
-                    penalizacion_sweep = -min(score_raw, niveles * 2)
-                    print(f"  [SWEEP_PEN] 🔴 ${prima_sw/1e6:.0f}M bajista → score {score_raw}{penalizacion_sweep:+d}")
-                elif tipo_sw == "ALCISTA" and score_raw < 0:
-                    penalizacion_sweep = min(abs(score_raw), niveles * 2)
-                    print(f"  [SWEEP_PEN] 🟢 ${prima_sw/1e6:.0f}M alcista → score {score_raw}+{penalizacion_sweep}")
-    except: pass
-    score_raw += penalizacion_sweep
-
     score_final = max(-10, min(10, score_raw))
 
     return {
@@ -2421,6 +2346,7 @@ def necesita_actualizar_macro():
     hora_actual = ahora.hour * 60 + ahora.minute
     apertura    = 9 * 60 + 30
     mediodia    = 12 * 60 + 30
+    evento_8h30 = 8 * 60 + 30  # Hora de eventos macro (CPI/NFP/PCE)
 
     # Resetear contador si es un nuevo día
     if contexto_macro.get("fecha_conteo") != hoy:
@@ -2435,30 +2361,38 @@ def necesita_actualizar_macro():
     mismo_dia  = ultima.date() == hoy if ultima else False
 
     # Cooldown mínimo absoluto de 60 minutos entre cualquier actualización
-    # Aplica SIEMPRE — incluso si ultima es None pero hubo actualizaciones hoy
     if ultima:
         mins_desde = (ahora - ultima).total_seconds() / 60
         if mins_desde < 60: return False
 
+    # ── Fix macro desactualizado en días de evento ────────────
+    # Si hay evento hoy a las 8:30 ET (CPI/NFP/PCE), no buscar
+    # contexto antes de que salga el dato — llegaría desactualizado
+    hoy_str = ahora.strftime("%Y-%m-%d")
+    hay_evento_hoy = any(
+        fecha == hoy_str and hora == evento_8h30
+        for fecha, hora in EVENTOS_MACRO_REALES.values()
+    )
+    if hay_evento_hoy and hora_actual < evento_8h30 + 15:
+        print(f"  [MACRO] ⏸ Día de evento — esperando hasta {evento_8h30 + 15} ET para buscar contexto")
+        return False
+
     # Actualización 1 — solo en ventana de apertura
-    # Si el bot reinicia fuera de esa ventana NO envía macro 1
     if contexto_macro["actualizaciones_hoy"] == 0:
         if apertura <= hora_actual <= apertura + 15:
             return True
         # Reinicio tardío — solo actualizar si es antes del mediodía
-        # y nunca se actualizó hoy
         if not mismo_dia and apertura + 15 < hora_actual < mediodia:
             return True
-        return False  # ← Fuera de ventana = NO actualizar
+        return False
 
     # Actualización 2 — solo en ventana de mediodía
-    # Requiere que ultima exista Y sea del mismo día
     if contexto_macro["actualizaciones_hoy"] == 1:
         if (mediodia <= hora_actual <= mediodia + 15
                 and mismo_dia and ultima
                 and (ahora - ultima).total_seconds() / 60 >= 60):
             return True
-        return False  # ← Fuera de ventana = NO actualizar
+        return False
 
     return False
 
@@ -2481,7 +2415,7 @@ EVENTOS_MACRO_REALES = {
     # Formato: "NOMBRE": ("YYYY-MM-DD", hora_ET_en_minutos)
     # Actualizar cada semana con el calendario económico real
     "NFP":  ("2026-06-05", 8*60+30),   # NFP mayo — ya ocurrió
-    "CPI":  ("2026-06-11", 8*60+30),   # CPI mayo — próximo miércoles
+    "CPI":  ("2026-06-10", 8*60+30),   # CPI mayo — hoy miércoles
     "FOMC": ("2026-06-17", 14*60+0),   # FOMC junio
     "PCE":  ("2026-06-27", 8*60+30),   # PCE mayo
 }
@@ -2623,7 +2557,7 @@ def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (9 * 60 <= hora_et <= 9 * 60 + 29): return  # 9:00-9:29 ET
+    if not (8 * 60 + 45 <= hora_et <= 9 * 60 + 29): return  # 8:45-9:29 ET
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
@@ -2678,8 +2612,19 @@ def enviar_pre_apertura():
         except Exception as e:
             print(f"  [CALENDARIO] Error en pre-apertura: {e}")
 
+        # ── COT Estimado texto ────────────────────────────────
+        cot_est_texto = ""
+        if cot_estimado_cache.get("disponible"):
+            confianza = cot_estimado_cache.get("confianza", 0)
+            sesgo_est = cot_estimado_cache.get("sesgo", "N/D")
+            cot_est_texto = f" | EST({confianza:.0%}): {sesgo_est}"
+
+        # ── Countdown dinámico ────────────────────────────────
+        mins_para_open = max(0, 9 * 60 + 30 - hora_et)
+        open_txt = f"en ~{mins_para_open} min" if mins_para_open > 0 else "¡AHORA!"
+
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
-               f"⏰ Mercado abre en ~15 minutos\n"
+               f"⏰ Mercado abre {open_txt}\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
                f"📊 {cot_texto}{cot_est_texto}\n"
                f"🌡️ {fg_texto}\n"
