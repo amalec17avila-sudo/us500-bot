@@ -539,7 +539,8 @@ def actualizar_cot_estimado():
 def validar_cot_estimado_vs_real():
     """
     Se llama cada viernes cuando llega el nuevo COT real.
-    Compara el estimado de la semana que terminó vs el real publicado.
+    Compara el estimado del miércoles vs el COT real publicado.
+    Este es el momento donde vemos qué tan bueno fue nuestro estimado.
     """
     global cot_estimado_cache
 
@@ -553,36 +554,82 @@ def validar_cot_estimado_vs_real():
     cot_base     = cot_estimado_cache["cot_base"]
     cambio_real  = cot_nuevo - cot_base
     cambio_est   = cot_estimado_cache["cambio_estimado"]
+    neto_est     = cot_estimado_cache["neto_estimado"]
+    sesgo_est    = cot_estimado_cache["sesgo"]
+    confianza    = cot_estimado_cache["confianza"]
     dias_acc     = cot_senales_semana["dias_acumulados"]
 
     if cot_base == 0:
         return
 
+    # Sesgo real del COT nuevo
+    sesgo_real = cot_cache.get("sesgo", "N/D")
+    fecha_real = cot_cache.get("fecha_reporte", "N/D")
+
     # Error relativo al COT base
     error_pct = abs((cambio_est - cambio_real) / abs(cot_base) * 100) if cot_base != 0 else 100
     precision = "✅ BUENA" if error_pct <= 3 else ("⚠️ ACEPTABLE" if error_pct <= 7 else "❌ MEJORAR")
+
+    # ¿El sesgo estimado coincidió con el real?
+    sesgo_correcto = (
+        ("ALCISTA" in sesgo_est and "ALCISTA" in sesgo_real) or
+        ("BAJISTA" in sesgo_est and "BAJISTA" in sesgo_real) or
+        (sesgo_est == "NEUTRAL" and sesgo_real == "NEUTRAL")
+    )
+    sesgo_icono = "✅" if sesgo_correcto else "❌"
 
     historial = cot_estimado_cache["historial_error"]
     historial.append(error_pct)
     if len(historial) > 4:
         historial.pop(0)
 
+    # Nueva confianza basada en historial actualizado
+    if len(historial) >= 2:
+        error_prom = sum(abs(e) for e in historial) / len(historial)
+        nueva_confianza = max(0.0, min(1.0, 1.0 - (error_prom / 10.0)))
+    elif len(historial) == 1:
+        nueva_confianza = 0.3
+    else:
+        nueva_confianza = 0.1
+    cot_estimado_cache["confianza"] = nueva_confianza
+
     print(f"  [COT_EST] 🎯 Validación: Base={cot_base:+,} | "
           f"Cambio estimado={cambio_est:+,} | Cambio real={cambio_real:+,} | "
-          f"Error={error_pct:.1f}% {precision}")
+          f"Error={error_pct:.1f}% {precision} | Sesgo:{sesgo_icono}")
 
     try:
-        bot.send_message(TELEGRAM_CHAT_ID,
-            f"🎯 *VALIDACIÓN COT ESTIMADO — Semana {cot_estimado_cache['semana_estimando']}*\n"
+        semanas_validadas = len(historial)
+        semanas_texto = f"{semanas_validadas}/4 semanas validadas"
+
+        if nueva_confianza >= 0.9:
+            estado_modelo = "🏆 MODELO CONFIABLE — Integrar al score ±2"
+        elif semanas_validadas >= 4:
+            estado_modelo = f"⚠️ {semanas_texto} — Continuar calibrando"
+        else:
+            estado_modelo = f"🔬 {semanas_texto} — Calibrando..."
+
+        msg = (
+            f"🎯 *COT REAL vs ESTIMADO — Semana {cot_estimado_cache['semana_estimando']}*\n"
             f"────────────────────────────\n"
-            f"📊 COT base (semana ant): `{cot_base:+,}`\n"
-            f"📈 Cambio estimado: `{cambio_est:+,}` ({dias_acc} días acumulados)\n"
-            f"📈 Cambio real CFTC: `{cambio_real:+,}`\n"
+            f"*COT REAL (CFTC — fecha corte: {fecha_real}):*\n"
+            f"📊 Neto real: `{cot_nuevo:+,}` contratos\n"
+            f"📈 Cambio real: `{cambio_real:+,}`\n"
+            f"🎯 Sesgo real: `{sesgo_real.replace('_',' ')}`\n"
+            f"────────────────────────────\n"
+            f"*NUESTRO ESTIMADO (del miércoles):*\n"
+            f"📊 Neto estimado: `{neto_est:+,}` contratos\n"
+            f"📈 Cambio estimado: `{cambio_est:+,}` ({dias_acc} días)\n"
+            f"🎯 Sesgo estimado: `{sesgo_est.replace('_',' ')}` {sesgo_icono}\n"
+            f"────────────────────────────\n"
             f"📐 Error: `{error_pct:.1f}%` {precision}\n"
+            f"🔬 Confianza nueva: `{nueva_confianza:.0%}`\n"
             f"────────────────────────────\n"
-            f"{'✅ Modelo confiable — usar en trading' if error_pct <= 3 else '⚠️ Semana ' + str(len(historial)) + '/4 — calibrando...'}",
-            parse_mode="Markdown")
-    except: pass
+            f"{estado_modelo}"
+        )
+        if len(msg) > 4096: msg = msg[:4090] + "..."
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+    except Exception as e:
+        print(f"  [COT_EST] Error enviando validación: {e}")
 
     # Iniciar acumulación para la próxima semana con el nuevo COT como base
     iniciar_acumulacion_cot()
@@ -2130,7 +2177,7 @@ def calcular_score_total(datos, minutos_apertura):
     dp_alcista      = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
 
     # Verificar dirección del precio vs COT
-    # precio_actual ya calculado arriba — no sobreescribir con datos dict
+    precio_actual   = datos.get("precio_actual", 0) if datos else 0
     tendencia_score = resultado_tendencia.get("score", 0) if "resultado_tendencia" in dir() else 0
 
     # Verificar sweep neto si está disponible
@@ -2346,7 +2393,6 @@ def necesita_actualizar_macro():
     hora_actual = ahora.hour * 60 + ahora.minute
     apertura    = 9 * 60 + 30
     mediodia    = 12 * 60 + 30
-    evento_8h30 = 8 * 60 + 30  # Hora de eventos macro (CPI/NFP/PCE)
 
     # Resetear contador si es un nuevo día
     if contexto_macro.get("fecha_conteo") != hoy:
@@ -2361,38 +2407,30 @@ def necesita_actualizar_macro():
     mismo_dia  = ultima.date() == hoy if ultima else False
 
     # Cooldown mínimo absoluto de 60 minutos entre cualquier actualización
+    # Aplica SIEMPRE — incluso si ultima es None pero hubo actualizaciones hoy
     if ultima:
         mins_desde = (ahora - ultima).total_seconds() / 60
         if mins_desde < 60: return False
 
-    # ── Fix macro desactualizado en días de evento ────────────
-    # Si hay evento hoy a las 8:30 ET (CPI/NFP/PCE), no buscar
-    # contexto antes de que salga el dato — llegaría desactualizado
-    hoy_str = ahora.strftime("%Y-%m-%d")
-    hay_evento_hoy = any(
-        fecha == hoy_str and hora == evento_8h30
-        for fecha, hora in EVENTOS_MACRO_REALES.values()
-    )
-    if hay_evento_hoy and hora_actual < evento_8h30 + 15:
-        print(f"  [MACRO] ⏸ Día de evento — esperando hasta {evento_8h30 + 15} ET para buscar contexto")
-        return False
-
     # Actualización 1 — solo en ventana de apertura
+    # Si el bot reinicia fuera de esa ventana NO envía macro 1
     if contexto_macro["actualizaciones_hoy"] == 0:
         if apertura <= hora_actual <= apertura + 15:
             return True
         # Reinicio tardío — solo actualizar si es antes del mediodía
+        # y nunca se actualizó hoy
         if not mismo_dia and apertura + 15 < hora_actual < mediodia:
             return True
-        return False
+        return False  # ← Fuera de ventana = NO actualizar
 
     # Actualización 2 — solo en ventana de mediodía
+    # Requiere que ultima exista Y sea del mismo día
     if contexto_macro["actualizaciones_hoy"] == 1:
         if (mediodia <= hora_actual <= mediodia + 15
                 and mismo_dia and ultima
                 and (ahora - ultima).total_seconds() / 60 >= 60):
             return True
-        return False
+        return False  # ← Fuera de ventana = NO actualizar
 
     return False
 
@@ -2415,7 +2453,7 @@ EVENTOS_MACRO_REALES = {
     # Formato: "NOMBRE": ("YYYY-MM-DD", hora_ET_en_minutos)
     # Actualizar cada semana con el calendario económico real
     "NFP":  ("2026-06-05", 8*60+30),   # NFP mayo — ya ocurrió
-    "CPI":  ("2026-06-10", 8*60+30),   # CPI mayo — hoy miércoles
+    "CPI":  ("2026-06-11", 8*60+30),   # CPI mayo — próximo miércoles
     "FOMC": ("2026-06-17", 14*60+0),   # FOMC junio
     "PCE":  ("2026-06-27", 8*60+30),   # PCE mayo
 }
@@ -2557,7 +2595,7 @@ def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (8 * 60 + 45 <= hora_et <= 9 * 60 + 29): return  # 8:45-9:29 ET
+    if not (9 * 60 <= hora_et <= 9 * 60 + 15): return
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
@@ -2612,19 +2650,8 @@ def enviar_pre_apertura():
         except Exception as e:
             print(f"  [CALENDARIO] Error en pre-apertura: {e}")
 
-        # ── COT Estimado texto ────────────────────────────────
-        cot_est_texto = ""
-        if cot_estimado_cache.get("disponible"):
-            confianza = cot_estimado_cache.get("confianza", 0)
-            sesgo_est = cot_estimado_cache.get("sesgo", "N/D")
-            cot_est_texto = f" | EST({confianza:.0%}): {sesgo_est}"
-
-        # ── Countdown dinámico ────────────────────────────────
-        mins_para_open = max(0, 9 * 60 + 30 - hora_et)
-        open_txt = f"en ~{mins_para_open} min" if mins_para_open > 0 else "¡AHORA!"
-
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
-               f"⏰ Mercado abre {open_txt}\n"
+               f"⏰ Mercado abre en ~15 minutos\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
                f"📊 {cot_texto}{cot_est_texto}\n"
                f"🌡️ {fg_texto}\n"
@@ -2707,6 +2734,99 @@ def enviar_resumen_dominical():
         print(f"  [DOMINICAL] Error: {e}")
 
 ultimo_alerta_overnight = {"hora": None}
+
+# Estado para reporte COT estimado de los miércoles
+cot_est_reporte_enviado = {"semana": None}
+
+def enviar_reporte_cot_estimado_miercoles():
+    """
+    Envía reporte COT Estimado cada miércoles a las 9:00 ET (7:00 HN)
+    antes de la apertura del mercado.
+    Ventaja: tenemos el estimado 3 días antes que el COT real de la CFTC.
+    """
+    ahora = hora_ny()
+
+    # Solo miércoles (weekday=2)
+    if ahora.weekday() != 2:
+        return
+
+    hora_et = ahora.hour * 60 + ahora.minute
+
+    # Ventana 9:00-9:15 ET
+    if not (9 * 60 <= hora_et <= 9 * 60 + 15):
+        return
+
+    semana_actual = ahora.isocalendar()[1]
+    if cot_est_reporte_enviado["semana"] == semana_actual:
+        return
+
+    if not cot_estimado_cache["disponible"]:
+        print("  [COT_EST_MIÉRC] Sin datos estimados disponibles")
+        return
+
+    print("  [COT_EST_MIÉRC] Preparando reporte semanal...")
+    try:
+        # Calcular ventana de fechas miérc→martes
+        hoy        = ahora.date()
+        miercoles  = hoy - timedelta(days=hoy.weekday() - 2) if hoy.weekday() >= 2 else hoy
+        # El miércoles de esta semana
+        dias_hasta_miercoles = (hoy.weekday() - 2) % 7
+        miercoles_inicio = hoy - timedelta(days=dias_hasta_miercoles)
+        martes_fin       = miercoles_inicio + timedelta(days=6)
+
+        neto_est    = cot_estimado_cache.get("neto_estimado", 0)
+        cot_base    = cot_estimado_cache.get("cot_base", 0)
+        cambio_est  = cot_estimado_cache.get("cambio_estimado", 0)
+        sesgo_est   = cot_estimado_cache.get("sesgo", "NEUTRAL")
+        confianza   = cot_estimado_cache.get("confianza", 0.0)
+        dias_acc    = cot_senales_semana.get("dias_acumulados", 0)
+        comps       = cot_estimado_cache.get("componentes", {})
+
+        # Emoji según sesgo
+        emoji_sesgo = "🟢" if "ALCISTA" in sesgo_est else ("🔴" if "BAJISTA" in sesgo_est else "⚪")
+
+        # Componentes del estimado
+        comp_sweep  = comps.get("sweep", 0)
+        comp_dp     = comps.get("dark_pool", 0)
+        comp_oi     = comps.get("rotacion", 0)
+        comp_pc     = comps.get("pc_semanal", 0)
+
+        # Nivel de confianza en texto
+        if confianza >= 0.9:
+            conf_txt = "🏆 ALTA (modelo validado)"
+        elif confianza >= 0.5:
+            conf_txt = "⚠️ MEDIA (calibrando)"
+        else:
+            conf_txt = "🔬 BAJA (experimental)"
+
+        msg = (
+            f"📊 *COT ESTIMADO — {miercoles_inicio.strftime('%d %b')} al {martes_fin.strftime('%d %b %Y')}*\n"
+            f"{'─'*28}\n"
+            f"{emoji_sesgo} *Sesgo estimado:* `{sesgo_est.replace('_',' ')}`\n"
+            f"📈 *Neto estimado:* `{neto_est:+,}` contratos\n"
+            f"📐 *Cambio vs semana ant:* `{cambio_est:+,}`\n"
+            f"🎯 *Base COT real:* `{cot_base:+,}`\n"
+            f"{'─'*28}\n"
+            f"*Componentes del estimado:*\n"
+            f"  • Sweep neto: `{comp_sweep:+,}`\n"
+            f"  • Dark Pool: `{comp_dp:+,}`\n"
+            f"  • CME OI: `{comp_oi:+,}`\n"
+            f"  • Put/Call: `{comp_pc:+,}`\n"
+            f"{'─'*28}\n"
+            f"📅 Días acumulados: `{dias_acc}`\n"
+            f"🔬 Confianza: {conf_txt}\n"
+            f"{'─'*28}\n"
+            f"⚡ *COT real CFTC llega el viernes*\n"
+            f"Ventaja: 3 días antes que el mercado retail."
+        )
+
+        if len(msg) > 4096: msg = msg[:4090] + "..."
+        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        cot_est_reporte_enviado["semana"] = semana_actual
+        print(f"  [COT_EST_MIÉRC] ✅ Reporte enviado — {sesgo_est} | Neto:{neto_est:+,} | Confianza:{confianza:.0%}")
+
+    except Exception as e:
+        print(f"  [COT_EST_MIÉRC] Error: {e}")
 
 def monitorear_overnight():
     try:
@@ -3262,6 +3382,20 @@ while True:
 
             enviar_resumen_dominical()
             monitorear_overnight()
+            # Reporte COT Estimado — solo miércoles a las 9:00 ET
+            enviar_reporte_cot_estimado_miercoles()
+            # ── COT Real CFTC — viernes al cierre (4:00 PM ET = 2:00 PM HN) ──
+            if ahora_ny.weekday() == 4:  # viernes
+                ultima_cot = cot_cache.get("ultima_actualizacion")
+                hoy_ny = ahora_ny.date()
+                if not ultima_cot or ultima_cot.date() != hoy_ny:
+                    print("  [COT_VIERNES] 📥 Descargando COT real CFTC...")
+                    if obtener_cot_report():
+                        print("  [COT_VIERNES] ✅ COT real actualizado — validando estimado...")
+                        if cot_estimado_cache["disponible"]:
+                            validar_cot_estimado_vs_real()
+                        else:
+                            iniciar_acumulacion_cot()
             elapsed = time.time() - inicio_ciclo
             time.sleep(max(0, 60 - elapsed))
             contador_ciclos += 1
