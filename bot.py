@@ -302,8 +302,10 @@ def _cot_proxy_fallback():
 
 # ── CME ES Open Interest desde GitHub ────────────────────────
 # URL del archivo JSON actualizado diariamente por GitHub Actions
-# Reemplaza TU_USUARIO y TU_REPO con los valores reales
-CME_OI_URL = "https://raw.githubusercontent.com/amalec17avila-sudo/us500-bot/main/data/es_oi.json"
+# Repo PRIVADO — se usa api.github.com con GH_TOKEN
+# (raw.githubusercontent.com devuelve 404 en repos privados)
+CME_OI_URL = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/es_oi.json"
+GH_TOKEN   = os.environ.get("GH_TOKEN", "")
 
 cme_oi_cache = {
     "disponible":        False,
@@ -319,17 +321,30 @@ def obtener_cme_oi():
     Lee el Open Interest diario de E-Mini S&P 500 desde GitHub.
     El archivo es actualizado automáticamente cada día al cierre
     por el workflow de GitHub Actions.
+    Usa la API de GitHub con GH_TOKEN porque el repo es privado.
     """
     global cme_oi_cache
     try:
-        import urllib.request, json
+        import urllib.request, json, base64
 
-        req = urllib.request.Request(CME_OI_URL, headers={
-            "User-Agent": "Mozilla/5.0",
+        gh_headers = {
+            "User-Agent":    "Mozilla/5.0",
+            "Accept":        "application/vnd.github.v3+json",
             "Cache-Control": "no-cache",
-        })
+        }
+        if GH_TOKEN:
+            gh_headers["Authorization"] = f"Bearer {GH_TOKEN}"
+
+        req = urllib.request.Request(CME_OI_URL, headers=gh_headers)
         with urllib.request.urlopen(req, timeout=10) as resp:
-            datos = json.loads(resp.read().decode())
+            api_response = json.loads(resp.read().decode())
+
+        # La API devuelve el contenido en base64
+        content_b64 = api_response.get("content", "")
+        if not content_b64:
+            print("  [CME_OI] ⚠️ Respuesta API sin contenido")
+            return
+        datos = json.loads(base64.b64decode(content_b64).decode("utf-8"))
 
         oi_actual      = datos.get("oi_actual", 0)
         cambio_diario  = datos.get("cambio_diario", 0)
