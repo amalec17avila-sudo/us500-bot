@@ -2177,7 +2177,7 @@ def calcular_score_total(datos, minutos_apertura):
     dp_alcista      = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
 
     # Verificar dirección del precio vs COT
-    precio_actual   = datos.get("precio_actual", 0) if datos else 0
+    # precio_actual ya calculado arriba — no sobreescribir con datos dict
     tendencia_score = resultado_tendencia.get("score", 0) if "resultado_tendencia" in dir() else 0
 
     # Verificar sweep neto si está disponible
@@ -2393,6 +2393,7 @@ def necesita_actualizar_macro():
     hora_actual = ahora.hour * 60 + ahora.minute
     apertura    = 9 * 60 + 30
     mediodia    = 12 * 60 + 30
+    evento_8h30 = 8 * 60 + 30  # Hora de eventos macro (CPI/NFP/PCE)
 
     # Resetear contador si es un nuevo día
     if contexto_macro.get("fecha_conteo") != hoy:
@@ -2407,30 +2408,38 @@ def necesita_actualizar_macro():
     mismo_dia  = ultima.date() == hoy if ultima else False
 
     # Cooldown mínimo absoluto de 60 minutos entre cualquier actualización
-    # Aplica SIEMPRE — incluso si ultima es None pero hubo actualizaciones hoy
     if ultima:
         mins_desde = (ahora - ultima).total_seconds() / 60
         if mins_desde < 60: return False
 
+    # ── Fix macro desactualizado en días de evento ────────────
+    # Si hay evento hoy a las 8:30 ET (CPI/NFP/PCE), no buscar
+    # contexto antes de que salga el dato — llegaría desactualizado
+    hoy_str = ahora.strftime("%Y-%m-%d")
+    hay_evento_hoy = any(
+        fecha == hoy_str and hora == evento_8h30
+        for fecha, hora in EVENTOS_MACRO_REALES.values()
+    )
+    if hay_evento_hoy and hora_actual < evento_8h30 + 15:
+        print(f"  [MACRO] ⏸ Día de evento — esperando hasta {evento_8h30 + 15} ET para buscar contexto")
+        return False
+
     # Actualización 1 — solo en ventana de apertura
-    # Si el bot reinicia fuera de esa ventana NO envía macro 1
     if contexto_macro["actualizaciones_hoy"] == 0:
         if apertura <= hora_actual <= apertura + 15:
             return True
         # Reinicio tardío — solo actualizar si es antes del mediodía
-        # y nunca se actualizó hoy
         if not mismo_dia and apertura + 15 < hora_actual < mediodia:
             return True
-        return False  # ← Fuera de ventana = NO actualizar
+        return False
 
     # Actualización 2 — solo en ventana de mediodía
-    # Requiere que ultima exista Y sea del mismo día
     if contexto_macro["actualizaciones_hoy"] == 1:
         if (mediodia <= hora_actual <= mediodia + 15
                 and mismo_dia and ultima
                 and (ahora - ultima).total_seconds() / 60 >= 60):
             return True
-        return False  # ← Fuera de ventana = NO actualizar
+        return False
 
     return False
 
@@ -2453,7 +2462,7 @@ EVENTOS_MACRO_REALES = {
     # Formato: "NOMBRE": ("YYYY-MM-DD", hora_ET_en_minutos)
     # Actualizar cada semana con el calendario económico real
     "NFP":  ("2026-06-05", 8*60+30),   # NFP mayo — ya ocurrió
-    "CPI":  ("2026-06-11", 8*60+30),   # CPI mayo — próximo miércoles
+    "CPI":  ("2026-06-10", 8*60+30),   # CPI mayo — ocurrió 10-jun
     "FOMC": ("2026-06-17", 14*60+0),   # FOMC junio
     "PCE":  ("2026-06-27", 8*60+30),   # PCE mayo
 }
@@ -2595,7 +2604,7 @@ def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (9 * 60 <= hora_et <= 9 * 60 + 15): return
+    if not (8 * 60 + 45 <= hora_et <= 9 * 60 + 29): return  # 8:45-9:29 ET
     print("  [PRE-APERTURA] Preparando contexto...")
     try:
         es_data       = descargar_futuros(period="2d", interval="5m")
@@ -2650,8 +2659,19 @@ def enviar_pre_apertura():
         except Exception as e:
             print(f"  [CALENDARIO] Error en pre-apertura: {e}")
 
+        # ── COT Estimado texto ────────────────────────────────
+        cot_est_texto = ""
+        if cot_estimado_cache.get("disponible"):
+            confianza = cot_estimado_cache.get("confianza", 0)
+            sesgo_est = cot_estimado_cache.get("sesgo", "N/D")
+            cot_est_texto = f" | EST({confianza:.0%}): {sesgo_est}"
+
+        # ── Countdown dinámico ────────────────────────────────
+        mins_para_open = max(0, 9 * 60 + 30 - hora_et)
+        open_txt = f"en ~{mins_para_open} min" if mins_para_open > 0 else "¡AHORA!"
+
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
-               f"⏰ Mercado abre en ~15 minutos\n"
+               f"⏰ Mercado abre {open_txt}\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
                f"📊 {cot_texto}{cot_est_texto}\n"
                f"🌡️ {fg_texto}\n"
