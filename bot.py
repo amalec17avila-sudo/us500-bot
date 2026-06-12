@@ -368,6 +368,272 @@ def obtener_cme_oi():
     except Exception as e:
         print(f"  [CME_OI] Error: {e}")
 
+# ================================================================
+# === SISTEMA DE APRENDIZAJE — JOURNAL DE SEÑALES ================
+# ================================================================
+# Cada señal ≥|7| se registra con sus componentes activos.
+# 30 y 60 min después se etiqueta como acierto/fallo según el precio.
+# Con el historial se calcula win rate por componente → base para
+# ajustar pesos. Persiste en GitHub (data/journal_senales.json).
+
+JOURNAL_URL          = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/journal_senales.json"
+JOURNAL_UMBRAL_30MIN = 3.0   # pts a favor para acierto a 30 min
+JOURNAL_UMBRAL_60MIN = 5.0   # pts a favor para acierto a 60 min
+JOURNAL_MAX_SENALES  = 500
+
+signal_journal = {
+    "senales":    [],     # historial completo
+    "pendientes": [],     # referencias a señales sin etiquetar
+    "sha":        None,   # sha del archivo en GitHub para updates
+    "dirty":      False,  # hay cambios sin guardar
+}
+
+def _gh_headers():
+    h = {"User-Agent": "Mozilla/5.0",
+         "Accept": "application/vnd.github.v3+json"}
+    if GH_TOKEN:
+        h["Authorization"] = f"Bearer {GH_TOKEN}"
+    return h
+
+def cargar_journal_github():
+    """Carga el journal desde GitHub al arrancar el bot."""
+    try:
+        import base64
+        req = urllib.request.Request(JOURNAL_URL, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api_resp = json.loads(resp.read().decode())
+        signal_journal["sha"] = api_resp.get("sha")
+        contenido = base64.b64decode(api_resp.get("content", "")).decode("utf-8")
+        datos = json.loads(contenido)
+        signal_journal["senales"] = datos.get("senales", [])[-JOURNAL_MAX_SENALES:]
+        # Reconstruir pendientes: señales sin resultado_60 ni expiradas
+        signal_journal["pendientes"] = [
+            s for s in signal_journal["senales"]
+            if s.get("resultado_60") is None and not s.get("expirada")
+        ]
+        print(f"  [JOURNAL] ✅ Cargado — {len(signal_journal['senales'])} señales, "
+              f"{len(signal_journal['pendientes'])} pendientes")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("  [JOURNAL] 📊 Sin journal previo — se creará al cierre")
+        else:
+            print(f"  [JOURNAL] Error cargando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [JOURNAL] Error cargando: {e}")
+
+def guardar_journal_github():
+    """Persiste el journal en GitHub. Se llama al cierre del mercado."""
+    if not signal_journal["dirty"] and signal_journal["sha"]:
+        return
+    if not GH_TOKEN:
+        print("  [JOURNAL] ⚠️ Sin GH_TOKEN — journal solo en memoria")
+        return
+    try:
+        import base64
+        payload_datos = {"senales": signal_journal["senales"][-JOURNAL_MAX_SENALES:]}
+        contenido_b64 = base64.b64encode(
+            json.dumps(payload_datos, ensure_ascii=False).encode("utf-8")
+        ).decode("ascii")
+        body = {
+            "message": f"Journal señales {hora_ny().strftime('%Y-%m-%d %H:%M')}",
+            "content": contenido_b64,
+        }
+        if signal_journal["sha"]:
+            body["sha"] = signal_journal["sha"]
+        req = urllib.request.Request(
+            JOURNAL_URL, data=json.dumps(body).encode("utf-8"),
+            headers={**_gh_headers(), "Content-Type": "application/json"},
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            api_resp = json.loads(resp.read().decode())
+        signal_journal["sha"]   = api_resp.get("content", {}).get("sha")
+        signal_journal["dirty"] = False
+        print(f"  [JOURNAL] 💾 Guardado en GitHub — {len(signal_journal['senales'])} señales")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            print("  [JOURNAL] ⚠️ GH_TOKEN sin permiso de ESCRITURA — dale 'contents: write'")
+        else:
+            print(f"  [JOURNAL] Error guardando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [JOURNAL] Error guardando: {e}")
+
+def registrar_senal_journal(resultado):
+    """Registra snapshot de una señal emitida para evaluarla después."""
+    try:
+        ahora = hora_ny()
+        comps_activos = {k: v for k, v in resultado["componentes"].items() if v != 0}
+        senal = {
+            "id":           ahora.strftime("%Y%m%d_%H%M%S"),
+            "fecha":        ahora.strftime("%Y-%m-%d"),
+            "hora":         ahora.strftime("%H:%M ET"),
+            "ts":           time.time(),
+            "direccion":    "ALCISTA" if resultado["score"] > 0 else "BAJISTA",
+            "score":        resultado["score"],
+            "precio":       resultado["detalle"]["precio"],
+            "componentes":  comps_activos,
+            "resultado_30": None, "delta_30": None,
+            "resultado_60": None, "delta_60": None,
+        }
+        signal_journal["senales"].append(senal)
+        signal_journal["pendientes"].append(senal)
+        if len(signal_journal["senales"]) > JOURNAL_MAX_SENALES:
+            signal_journal["senales"] = signal_journal["senales"][-JOURNAL_MAX_SENALES:]
+        signal_journal["dirty"] = True
+        print(f"  [JOURNAL] 📝 Señal registrada — {senal['direccion']} {senal['score']:+d} @ {senal['precio']}")
+    except Exception as e:
+        print(f"  [JOURNAL] Error registrando: {e}")
+
+def verificar_senales_pendientes(precio_actual):
+    """Etiqueta señales pendientes a 30 y 60 min según el precio actual."""
+    if not signal_journal["pendientes"]:
+        return
+    ahora_ts   = time.time()
+    completadas = []
+    for s in signal_journal["pendientes"]:
+        try:
+            mins = (ahora_ts - s["ts"]) / 60
+            # Delta a favor de la dirección de la señal
+            if s["direccion"] == "ALCISTA":
+                delta = precio_actual - s["precio"]
+            else:
+                delta = s["precio"] - precio_actual
+
+            if mins >= 30 and s["resultado_30"] is None:
+                s["delta_30"]    = round(delta, 2)
+                s["resultado_30"] = delta >= JOURNAL_UMBRAL_30MIN
+                signal_journal["dirty"] = True
+                print(f"  [JOURNAL] 30min {s['id']}: {'✅' if s['resultado_30'] else '❌'} ({delta:+.1f} pts)")
+
+            if mins >= 60 and s["resultado_60"] is None:
+                s["delta_60"]    = round(delta, 2)
+                s["resultado_60"] = delta >= JOURNAL_UMBRAL_60MIN
+                signal_journal["dirty"] = True
+                completadas.append(s)
+                print(f"  [JOURNAL] 60min {s['id']}: {'✅' if s['resultado_60'] else '❌'} ({delta:+.1f} pts)")
+
+            # Señal vieja sin etiquetar (reinicio largo) → expirar
+            if mins > 90 and s["resultado_60"] is None:
+                s["expirada"] = True
+                signal_journal["dirty"] = True
+                completadas.append(s)
+        except Exception as e:
+            print(f"  [JOURNAL] Error verificando {s.get('id','?')}: {e}")
+            completadas.append(s)
+    for s in completadas:
+        if s in signal_journal["pendientes"]:
+            signal_journal["pendientes"].remove(s)
+
+def calcular_win_rates():
+    """Win rate por componente sobre señales con resultado_60 conocido."""
+    stats = {}
+    total_senales = 0
+    wins_senales  = 0
+    for s in signal_journal["senales"]:
+        if s.get("expirada") or s.get("resultado_60") is None:
+            continue
+        win = s["resultado_60"]
+        total_senales += 1
+        if win: wins_senales += 1
+        dir_alcista = s["direccion"] == "ALCISTA"
+        for comp, val in s.get("componentes", {}).items():
+            # Solo componentes alineados con la dirección de la señal
+            alineado = (val > 0 and dir_alcista) or (val < 0 and not dir_alcista)
+            if not alineado:
+                continue
+            st = stats.setdefault(comp, {"wins": 0, "total": 0})
+            st["total"] += 1
+            if win: st["wins"] += 1
+    return stats, total_senales, wins_senales
+
+def texto_win_rates():
+    """Resumen de win rates para Telegram (resumen dominical)."""
+    stats, total, wins = calcular_win_rates()
+    if total == 0:
+        return ""
+    wr_global = wins / total * 100
+    lineas = [f"\n{'─'*28}\n🧠 *Aprendizaje ({total} señales evaluadas):*",
+              f"  Win rate global 60min: `{wr_global:.0f}%`"]
+    # Ordenar por win rate, solo componentes con n>=3
+    orden = sorted(
+        [(c, st["wins"]/st["total"]*100, st["total"])
+         for c, st in stats.items() if st["total"] >= 3],
+        key=lambda x: -x[1])
+    for comp, wr, n in orden[:6]:
+        emoji = "🟢" if wr >= 65 else ("⚪" if wr >= 45 else "🔴")
+        lineas.append(f"  {emoji} {comp.replace('_',' ')}: `{wr:.0f}%` (n={n})")
+    if orden:
+        peor = orden[-1]
+        if peor[1] < 40:
+            lineas.append(f"  💡 Candidato a bajar peso: {peor[0].replace('_',' ')}")
+    return "\n".join(lineas)
+
+# ── Persistencia del estado COT Estimado en GitHub ───────────
+# Sin esto, cada deploy de Railway borra la acumulación de la semana.
+COT_ESTADO_URL = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/cot_estado.json"
+_cot_estado_sha = {"sha": None}
+
+def guardar_estado_cot_github():
+    """Persiste cot_estimado_cache + cot_senales_semana en GitHub."""
+    if not GH_TOKEN:
+        return
+    try:
+        import base64
+        estado = {
+            "cot_estimado_cache": {k: v for k, v in cot_estimado_cache.items()
+                                   if k != "ultima_actualizacion"},
+            "cot_senales_semana": dict(cot_senales_semana),
+            "guardado":           hora_ny().strftime("%Y-%m-%d %H:%M ET"),
+        }
+        contenido_b64 = base64.b64encode(
+            json.dumps(estado, ensure_ascii=False, default=str).encode("utf-8")
+        ).decode("ascii")
+        body = {"message": f"Estado COT {hora_ny().strftime('%Y-%m-%d %H:%M')}",
+                "content": contenido_b64}
+        if _cot_estado_sha["sha"]:
+            body["sha"] = _cot_estado_sha["sha"]
+        req = urllib.request.Request(
+            COT_ESTADO_URL, data=json.dumps(body).encode("utf-8"),
+            headers={**_gh_headers(), "Content-Type": "application/json"},
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            api_resp = json.loads(resp.read().decode())
+        _cot_estado_sha["sha"] = api_resp.get("content", {}).get("sha")
+        print("  [COT_ESTADO] 💾 Estado COT guardado en GitHub")
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403):
+            print("  [COT_ESTADO] ⚠️ GH_TOKEN sin permiso de escritura")
+        else:
+            print(f"  [COT_ESTADO] Error guardando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [COT_ESTADO] Error guardando: {e}")
+
+def cargar_estado_cot_github():
+    """Restaura el estado COT al arrancar — sobrevive a los deploys."""
+    try:
+        import base64
+        req = urllib.request.Request(COT_ESTADO_URL, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api_resp = json.loads(resp.read().decode())
+        _cot_estado_sha["sha"] = api_resp.get("sha")
+        estado = json.loads(base64.b64decode(api_resp.get("content", "")).decode("utf-8"))
+        cec = estado.get("cot_estimado_cache", {})
+        if cec.get("disponible"):
+            cot_estimado_cache.update(cec)
+            cot_estimado_cache["ultima_actualizacion"] = None  # fuerza recálculo
+        css = estado.get("cot_senales_semana", {})
+        if css:
+            cot_senales_semana.update(css)
+        print(f"  [COT_ESTADO] ✅ Restaurado — base:{cot_estimado_cache.get('cot_base',0):+,} | "
+              f"días acumulados:{cot_senales_semana.get('dias_acumulados',0)} | "
+              f"guardado: {estado.get('guardado','?')}")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("  [COT_ESTADO] 📊 Sin estado previo — se creará el viernes")
+        else:
+            print(f"  [COT_ESTADO] Error cargando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [COT_ESTADO] Error cargando: {e}")
+
 def iniciar_acumulacion_cot():
     """
     Se llama cada viernes cuando llega el nuevo COT real.
@@ -1040,6 +1306,155 @@ def evaluar_gex(precio_actual):
     }
 
 # ================================================================
+# === GEX 0DTE — FLUJO DEALER INTRADÍA ===========================
+# ================================================================
+# Más del 50% del volumen de opciones es 0DTE. El hedging de los
+# dealers sobre ESOS contratos es lo que empuja el precio HOY.
+# Gamma positiva sobre el flip 0DTE = dealers amortiguan (rango).
+# Gamma negativa bajo el flip 0DTE = dealers amplifican (tendencia).
+
+gex_0dte_cache = {
+    "disponible":           False,
+    "neto":                 0.0,
+    "neto_anterior":        0.0,
+    "flip_0dte":            None,   # en escala US500
+    "expiracion":           None,
+    "ultima_actualizacion": None,
+    "alerta_giro_enviada":  False,
+    "dia":                  None,
+}
+
+def obtener_gex_0dte():
+    """Calcula GEX solo de la expiración de HOY usando OI + volumen."""
+    if not TRADIER_TOKEN:
+        return
+    try:
+        ahora   = hora_ny()
+        hoy_str = ahora.strftime("%Y-%m-%d")
+
+        # Reset diario
+        if gex_0dte_cache["dia"] != ahora.date():
+            gex_0dte_cache.update({"dia": ahora.date(), "neto_anterior": 0.0,
+                                   "alerta_giro_enviada": False})
+
+        url_exp = "https://api.tradier.com/v1/markets/options/expirations?symbol=SPY&includeAllRoots=true"
+        req = urllib.request.Request(url_exp, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data_exp = json.loads(resp.read().decode())
+        expiraciones = data_exp.get("expirations", {}).get("date", [])
+        if isinstance(expiraciones, str): expiraciones = [expiraciones]
+        if not expiraciones or expiraciones[0] != hoy_str:
+            gex_0dte_cache["disponible"] = False
+            return
+
+        url_chain = (f"https://api.tradier.com/v1/markets/options/chains"
+                     f"?symbol=SPY&expiration={hoy_str}&greeks=true")
+        req = urllib.request.Request(url_chain, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data_chain = json.loads(resp.read().decode())
+        opciones = data_chain.get("options", {}).get("option", [])
+        if not opciones:
+            gex_0dte_cache["disponible"] = False
+            return
+
+        spy_t = yf.Ticker("SPY")
+        precio_spy = spy_t.fast_info.last_price or 0
+        if not precio_spy:
+            return
+
+        gex_por_strike = {}
+        for op in opciones:
+            strike = float(op.get("strike", 0))
+            if strike <= 0 or abs(strike - precio_spy) / precio_spy > 0.03:
+                continue  # solo ±3% del precio — donde vive el 0DTE
+            oi      = float(op.get("open_interest", 0) or 0)
+            vol     = float(op.get("volume", 0) or 0)
+            greeks  = op.get("greeks", {}) or {}
+            gamma   = float(greeks.get("gamma", 0) or 0)
+            if gamma <= 0:
+                continue
+            # En 0DTE el volumen del día pesa más que el OI matinal
+            exposicion = oi + vol
+            if exposicion <= 0:
+                continue
+            gex = gamma * exposicion * 100 * strike
+            tipo = op.get("option_type", "")
+            if tipo == "call":
+                gex_por_strike[strike] = gex_por_strike.get(strike, 0) + gex
+            elif tipo == "put":
+                gex_por_strike[strike] = gex_por_strike.get(strike, 0) - gex
+
+        if not gex_por_strike:
+            gex_0dte_cache["disponible"] = False
+            return
+
+        neto = sum(gex_por_strike.values())
+
+        # Flip 0DTE — cruce del acumulado más cercano al precio
+        strikes_ord  = sorted(gex_por_strike.keys())
+        cruces, acum = [], 0.0
+        for st in strikes_ord:
+            prev  = acum
+            acum += gex_por_strike[st]
+            if prev != 0 and prev * acum < 0:
+                cruces.append(st)
+        if cruces:
+            flip = min(cruces, key=lambda k: abs(k - precio_spy))
+        else:
+            flip = min(gex_por_strike, key=lambda k: abs(gex_por_strike[k]))
+
+        neto_ant = gex_0dte_cache.get("neto", 0.0)
+        gex_0dte_cache.update({
+            "disponible":           True,
+            "neto":                 neto,
+            "neto_anterior":        neto_ant,
+            "flip_0dte":            round(flip * 10, 0),
+            "expiracion":           hoy_str,
+            "ultima_actualizacion": ahora,
+        })
+        regimen = "AMORTIGUA (rango)" if neto > 0 else "AMPLIFICA (tendencia)"
+        print(f"  [GEX_0DTE] ✅ Neto:{neto:+,.0f} | Flip0DTE:{flip*10:.0f} | Dealers: {regimen}")
+
+        # Alerta si el neto 0DTE cambia de signo intradía (giro de régimen)
+        if (neto_ant != 0 and neto * neto_ant < 0
+                and not gex_0dte_cache["alerta_giro_enviada"]):
+            gex_0dte_cache["alerta_giro_enviada"] = True
+            nuevo_reg = "🟢 GAMMA POSITIVA — dealers frenarán los movimientos" \
+                        if neto > 0 else "🔴 GAMMA NEGATIVA — dealers amplificarán los movimientos"
+            try:
+                bot.send_message(TELEGRAM_CHAT_ID,
+                    f"⚡ *GIRO DE RÉGIMEN GEX 0DTE*\n"
+                    f"El flujo dealer de HOY cambió de signo.\n{nuevo_reg}\n"
+                    f"Flip 0DTE: `{gex_0dte_cache['flip_0dte']}`",
+                    parse_mode="Markdown")
+                print("  [GEX_0DTE] ⚡ Alerta giro de régimen enviada")
+            except Exception as e:
+                print(f"  [GEX_0DTE] Error alerta: {e}")
+
+    except Exception as e:
+        print(f"  [GEX_0DTE] Error: {e}")
+
+def evaluar_gex_0dte(precio_actual):
+    if not gex_0dte_cache["disponible"]:
+        return {"disponible": False, "score": 0, "señal": "N/D"}
+    flip = gex_0dte_cache["flip_0dte"]
+    neto = gex_0dte_cache["neto"]
+    if not flip:
+        return {"disponible": False, "score": 0, "señal": "N/D"}
+    if precio_actual > flip:
+        score = 1
+        señal = f"Sobre Flip0DTE({flip:.0f}) — dealers soportan"
+    else:
+        score = -1
+        señal = f"Bajo Flip0DTE({flip:.0f}) — dealers presionan"
+    if neto < 0:
+        señal += " | GAMMA NEG: movimientos amplificados"
+    return {"disponible": True, "score": score, "señal": señal,
+            "flip_0dte": flip, "neto": neto}
+
+# ================================================================
 # === MEJORA C: DARK POOL GRANULAR ================================
 # ================================================================
 
@@ -1148,9 +1563,9 @@ def detectar_squeeze_volatilidad(datos, precio_actual):
         })
 
     try:
-        spy   = datos["spy"]
-        high  = datos["high"]
-        low   = datos["low"]
+        spy   = datos["close"]["^GSPC"]
+        high  = datos["high"]["^GSPC"]
+        low   = datos["low"]["^GSPC"]
 
         if len(high) < 15 or len(low) < 15:
             return
@@ -1867,6 +2282,218 @@ def evaluar_detector_rango(precio_actual, gamma_flip):
                 "distancia_flip": round(distancia_flip, 1)}
 
 # ================================================================
+# === MÓDULOS INSTITUCIONALES AVANZADOS (v4.0) ===================
+# ================================================================
+
+# ── Vol-Control / CTA proxy ──────────────────────────────────
+# Los fondos volatility-targeting y CTAs compran/venden MECÁNICAMENTE
+# según la vol realizada. Vol cayendo → compra forzada días siguientes.
+vol_control_cache = {"disponible": False, "rv10": None, "rv20": None,
+                     "ratio": None, "señal": "N/D", "score": 0, "dia": None}
+
+def evaluar_vol_control():
+    ahora = hora_ny()
+    if vol_control_cache["dia"] == ahora.date() and vol_control_cache["disponible"]:
+        return dict(vol_control_cache)
+    try:
+        spy = yf.download("SPY", period="40d", interval="1d", progress=False)
+        if spy.empty or len(spy) < 22:
+            return {"disponible": False, "score": 0, "señal": "N/D"}
+        close = spy["Close"]
+        if hasattr(close, "columns"): close = close.iloc[:, 0]
+        close = close.squeeze().dropna()
+        rets  = np.log(close / close.shift(1)).dropna()
+        rv10  = float(rets.iloc[-10:].std() * np.sqrt(252) * 100)
+        rv20  = float(rets.iloc[-20:].std() * np.sqrt(252) * 100)
+        if rv20 <= 0:
+            return {"disponible": False, "score": 0, "señal": "N/D"}
+        ratio = rv10 / rv20
+        if ratio < 0.80:
+            score = 1;  señal = "VOL CAYENDO — compra mecánica vol-control próxima"
+        elif ratio > 1.30:
+            score = -1; señal = "VOL SUBIENDO — venta mecánica CTA/vol-control"
+        else:
+            score = 0;  señal = "Flujo vol-control neutral"
+        vol_control_cache.update({
+            "disponible": True, "rv10": round(rv10, 2), "rv20": round(rv20, 2),
+            "ratio": round(ratio, 3), "señal": señal, "score": score, "dia": ahora.date()})
+        print(f"  [VOL_CTL] ✅ RV10:{rv10:.1f}% RV20:{rv20:.1f}% ratio:{ratio:.2f} → {señal}")
+        return dict(vol_control_cache)
+    except Exception as e:
+        print(f"  [VOL_CTL] Error: {e}")
+        return {"disponible": False, "score": 0, "señal": "N/D"}
+
+# ── Divergencia de crédito (HYG) ─────────────────────────────
+# El crédito huele el riesgo antes que las acciones.
+# SPY en máximos con HYG sin acompañar = distribución encubierta.
+credito_cache = {"disponible": False, "score": 0, "señal": "N/D",
+                 "spy_3d": None, "hyg_3d": None, "ultima_actualizacion": None}
+
+def evaluar_credito_hyg():
+    ahora = hora_ny()
+    if (credito_cache["ultima_actualizacion"] and
+        (ahora - credito_cache["ultima_actualizacion"]).total_seconds() / 60 < 30):
+        return dict(credito_cache)
+    try:
+        spy = yf.download("SPY", period="6d", interval="1d", progress=False)
+        hyg = yf.download("HYG", period="6d", interval="1d", progress=False)
+        if spy.empty or hyg.empty or len(spy) < 4 or len(hyg) < 4:
+            return {"disponible": False, "score": 0, "señal": "N/D"}
+        spy_c = spy["Close"];  hyg_c = hyg["Close"]
+        if hasattr(spy_c, "columns"): spy_c = spy_c.iloc[:, 0]
+        if hasattr(hyg_c, "columns"): hyg_c = hyg_c.iloc[:, 0]
+        spy_c = spy_c.squeeze(); hyg_c = hyg_c.squeeze()
+        spy_3d = float((spy_c.iloc[-1] / spy_c.iloc[-4] - 1) * 100)
+        hyg_3d = float((hyg_c.iloc[-1] / hyg_c.iloc[-4] - 1) * 100)
+        if spy_3d > 0.3 and hyg_3d < -0.2:
+            score = -2; señal = "CRÉDITO NO CONFIRMA — distribución encubierta"
+        elif spy_3d > 0.1 and hyg_3d < 0:
+            score = -1; señal = "Crédito rezagado — rally frágil"
+        elif spy_3d < -0.3 and hyg_3d >= 0:
+            score = 1;  señal = "Crédito ignora la caída — sobrerreacción equity"
+        elif spy_3d > 0.1 and hyg_3d > 0.1:
+            score = 1;  señal = "Crédito confirma el alza"
+        else:
+            score = 0;  señal = "Crédito neutral"
+        credito_cache.update({
+            "disponible": True, "score": score, "señal": señal,
+            "spy_3d": round(spy_3d, 2), "hyg_3d": round(hyg_3d, 2),
+            "ultima_actualizacion": ahora})
+        print(f"  [HYG] ✅ SPY3d:{spy_3d:+.2f}% HYG3d:{hyg_3d:+.2f}% → {señal}")
+        return dict(credito_cache)
+    except Exception as e:
+        print(f"  [HYG] Error: {e}")
+        return {"disponible": False, "score": 0, "señal": "N/D"}
+
+# ── VWAP del día ─────────────────────────────────────────────
+# Los algos institucionales ejecutan contra VWAP. Precio sobre/bajo
+# el VWAP dice quién controla la sesión.
+def calcular_vwap_dia(datos, minutos_apertura):
+    try:
+        close  = datos["close"]["^GSPC"]
+        volume = datos["volume"]["^GSPC"]
+        velas  = max(2, min(int(minutos_apertura), len(close)))
+        p = close.iloc[-velas:]
+        v = volume.iloc[-velas:]
+        v_sum = float(v.sum())
+        if v_sum <= 0:
+            return {"disponible": False, "score": 0, "señal": "N/D", "vwap": None}
+        vwap   = float((p * v).sum() / v_sum)
+        precio = float(close.iloc[-1])
+        if precio > vwap * 1.0005:
+            score = 1;  señal = f"Sobre VWAP({vwap:.1f}) — compradores controlan"
+        elif precio < vwap * 0.9995:
+            score = -1; señal = f"Bajo VWAP({vwap:.1f}) — vendedores controlan"
+        else:
+            score = 0;  señal = f"En VWAP({vwap:.1f}) — batalla"
+        return {"disponible": True, "score": score, "señal": señal,
+                "vwap": round(vwap, 2)}
+    except Exception as e:
+        return {"disponible": False, "score": 0, "señal": f"ERR:{e}", "vwap": None}
+
+# ── OPEX / Charm ─────────────────────────────────────────────
+# Vencimientos mensuales: pinning antes, liberación direccional después.
+# Viernes 14:30-16:00 ET: flujo de charm favorece la tendencia del día.
+OPEX_FECHAS_2026 = {
+    "2026-01-16", "2026-02-20", "2026-03-20", "2026-04-17",
+    "2026-05-15", "2026-06-18",  # 19-jun festivo → vence jueves 18
+    "2026-07-17", "2026-08-21", "2026-09-18", "2026-10-16",
+    "2026-11-20", "2026-12-18",
+}
+TRIPLE_WITCHING_2026 = {"2026-03-20", "2026-06-18", "2026-09-18", "2026-12-18"}
+charm_alertado = {"dia": None}
+
+def contexto_opex():
+    ahora = hora_ny()
+    hoy   = ahora.date()
+    ctx = {"es_opex_hoy": False, "es_semana_opex": False,
+           "es_post_opex": False, "es_triple": False, "proximo_opex": None}
+    try:
+        fechas = sorted(datetime.strptime(f, "%Y-%m-%d").date() for f in OPEX_FECHAS_2026)
+        futuras = [f for f in fechas if f >= hoy]
+        pasadas = [f for f in fechas if f < hoy]
+        if futuras:
+            prox = futuras[0]
+            ctx["proximo_opex"] = prox.strftime("%d %b")
+            ctx["es_opex_hoy"]  = (prox == hoy)
+            ctx["es_triple"]    = prox.strftime("%Y-%m-%d") in TRIPLE_WITCHING_2026
+            # Misma semana ISO que el próximo vencimiento
+            ctx["es_semana_opex"] = (prox.isocalendar()[:2] == hoy.isocalendar()[:2])
+        if pasadas:
+            dias_desde = (hoy - pasadas[-1]).days
+            ctx["es_post_opex"] = 1 <= dias_desde <= 5 and hoy.weekday() <= 2
+    except Exception as e:
+        print(f"  [OPEX] Error: {e}")
+    return ctx
+
+# ── Liquidez neta de la Fed (FRED) ───────────────────────────
+# Liquidez neta = Balance Fed (WALCL) - RRP - TGA. Es la marea de
+# fondo: cuando cae sostenida, las correcciones llegan semanas después.
+fed_liquidez_cache = {"disponible": False, "neta": None, "cambio_4w": None,
+                      "tendencia": "N/D", "semana": None}
+
+def _fred_serie(serie_id):
+    """Descarga CSV público de FRED y devuelve [(fecha, valor), ...]."""
+    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={serie_id}"
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        texto = resp.read().decode("utf-8", errors="ignore")
+    datos = []
+    for linea in texto.strip().split("\n")[1:]:
+        partes = linea.split(",")
+        if len(partes) >= 2 and partes[1].strip() not in (".", ""):
+            try:
+                datos.append((datetime.strptime(partes[0].strip(), "%Y-%m-%d").date(),
+                              float(partes[1].strip())))
+            except: continue
+    return datos
+
+def _fred_valor_en(datos, fecha_objetivo):
+    """Último valor con fecha <= fecha_objetivo."""
+    candidatos = [v for f, v in datos if f <= fecha_objetivo]
+    return candidatos[-1] if candidatos else None
+
+def obtener_liquidez_fed():
+    ahora  = hora_ny()
+    semana = ahora.isocalendar()[1]
+    if fed_liquidez_cache["semana"] == semana and fed_liquidez_cache["disponible"]:
+        return
+    try:
+        hoy      = ahora.date()
+        hace_4w  = hoy - timedelta(days=28)
+        walcl    = _fred_serie("WALCL")       # balance Fed — millones $
+        rrp      = _fred_serie("RRPONTSYD")   # reverse repo — billones $
+        tga      = _fred_serie("WTREGEN")     # cuenta Tesoro — billones $
+        if not walcl or not rrp or not tga:
+            print("  [FED_LIQ] ⚠️ Series FRED incompletas")
+            return
+        def neta_en(fecha):
+            w = _fred_valor_en(walcl, fecha)
+            r = _fred_valor_en(rrp,   fecha)
+            t = _fred_valor_en(tga,   fecha)
+            if w is None or r is None or t is None:
+                return None
+            return w / 1000.0 - r - t  # todo en billones $
+        neta_now = neta_en(hoy)
+        neta_4w  = neta_en(hace_4w)
+        if neta_now is None or neta_4w is None:
+            print("  [FED_LIQ] ⚠️ Sin datos suficientes")
+            return
+        cambio = neta_now - neta_4w
+        if cambio > 50:
+            tendencia = "EXPANDIENDO 🟢"
+        elif cambio < -50:
+            tendencia = "CONTRAYENDO 🔴"
+        else:
+            tendencia = "ESTABLE ⚪"
+        fed_liquidez_cache.update({
+            "disponible": True, "neta": round(neta_now, 0),
+            "cambio_4w": round(cambio, 0), "tendencia": tendencia, "semana": semana})
+        print(f"  [FED_LIQ] ✅ Neta: ${neta_now:,.0f}B | Δ4sem: {cambio:+,.0f}B → {tendencia}")
+    except Exception as e:
+        print(f"  [FED_LIQ] Error: {e}")
+
+# ================================================================
 # === DESCARGA Y INDICADORES BASE ================================
 # ================================================================
 
@@ -2173,6 +2800,10 @@ def calcular_score_total(datos, minutos_apertura):
     rotacion   = evaluar_rotacion_defensiva(datos)
     breadth    = evaluar_breadth()
     fear_greed = calcular_fear_greed(vix_nivel_act, vvix, put_call)
+    gex_0dte   = evaluar_gex_0dte(precio_actual)
+    vol_ctl    = evaluar_vol_control()
+    credito    = evaluar_credito_hyg()
+    vwap_r     = calcular_vwap_dia(datos, minutos_apertura)
 
     if vix_ratio.get("disponible") and vix_ratio.get("ratio"):
         vix_ratio_historia.append(vix_ratio["ratio"])
@@ -2253,6 +2884,10 @@ def calcular_score_total(datos, minutos_apertura):
         "rotacion":        rotacion["score"],
         "breadth":         breadth["score"],
         "fear_greed":      fear_greed["score"],
+        "gex_0dte":        gex_0dte["score"],
+        "vol_control":     vol_ctl["score"],
+        "credito_hyg":     credito["score"],
+        "vwap":            vwap_r["score"],
     }
 
     score_raw = sum(componentes.values())
@@ -2305,6 +2940,8 @@ def calcular_score_total(datos, minutos_apertura):
             "cot": cot, "mcclellan": mcclellan, "vvix": vvix,
             "put_call": put_call, "rotacion": rotacion,
             "breadth": breadth, "fear_greed": fear_greed,
+            "gex_0dte": gex_0dte, "vol_control": vol_ctl,
+            "credito_hyg": credito, "vwap": vwap_r,
         }
     }
 
@@ -2685,6 +3322,19 @@ def enviar_pre_apertura():
         mins_para_open = max(0, 9 * 60 + 30 - hora_et)
         open_txt = f"en ~{mins_para_open} min" if mins_para_open > 0 else "¡AHORA!"
 
+        # ── Contexto OPEX ─────────────────────────────────────
+        opex_texto = ""
+        try:
+            ctx_opex = contexto_opex()
+            if ctx_opex["es_opex_hoy"]:
+                tw = " TRIPLE WITCHING" if ctx_opex["es_triple"] else ""
+                opex_texto = f"\n📌 *HOY VENCE OPEX{tw}* — pinning probable cerca de los walls"
+            elif ctx_opex["es_semana_opex"]:
+                opex_texto = f"\n📌 Semana OPEX (vence {ctx_opex['proximo_opex']}) — gravitación hacia walls"
+            elif ctx_opex["es_post_opex"]:
+                opex_texto = "\n📌 Post-OPEX — flujos liberados, más dirección probable"
+        except: pass
+
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
                f"⏰ Mercado abre {open_txt}\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
@@ -2693,6 +3343,7 @@ def enviar_pre_apertura():
                f"📉 {breadth_texto}\n"
                f"🌍 Macro: `{macro_imp}`"
                f"{gex_texto}"
+               f"{opex_texto}"
                f"{calendario_texto}")
         bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         pre_apertura_enviado["dia"] = ahora.date()
@@ -2742,6 +3393,17 @@ def enviar_resumen_dominical():
         sesgo_macro      = resultado_macro.get("sesgo", "N/D") if resultado_macro else "N/D"
         noticias_semana  = resultado_macro.get("noticias", []) if resultado_macro else []
         noticias_str     = "\n".join(f"  • {n}" for n in noticias_semana[:3])
+        # ── Liquidez Fed + aprendizaje ────────────────────────
+        obtener_liquidez_fed()
+        liq_fed_txt = ""
+        if fed_liquidez_cache["disponible"]:
+            liq_fed_txt = (f"\n💧 Liquidez Fed neta: `${fed_liquidez_cache['neta']:,.0f}B` "
+                           f"(Δ4sem: `{fed_liquidez_cache['cambio_4w']:+,.0f}B`) — {fed_liquidez_cache['tendencia']}")
+        wr_txt = ""
+        try:
+            wr_txt = texto_win_rates()
+        except Exception as e:
+            print(f"  [JOURNAL] Error win rates: {e}")
         emoji_cot = "🟢" if "ALCISTA" in cot_sesgo else ("🔴" if "BAJISTA" in cot_sesgo else "⚪")
         msg = (f"📊 *RESUMEN DOMINICAL — Semana {semana_actual}*\n{'─'*28}\n"
                f"*Posicionamiento Smart Money (COT {cot_fuente}):*\n"
@@ -2751,7 +3413,8 @@ def enviar_resumen_dominical():
                f"💵 Precio: `{futuro_precio:.0f}` | Semana: `{futuro_cambio_semana:+.2f}%`"
                f"{gex_lunes}\n{'─'*28}\n"
                f"*Noticias clave semana:*\n{noticias_str}\n{'─'*28}\n"
-               f"*Sesgo institucional:* {sesgo_macro}\n"
+               f"*Sesgo institucional:* {sesgo_macro}"
+               f"{liq_fed_txt}{wr_txt}\n"
                f"📅 Mercado abre mañana 9:30 ET")
         if len(msg) > 4096: msg = msg[:4090] + "..."
         bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
@@ -2801,13 +3464,11 @@ def enviar_reporte_cot_estimado_miercoles():
 
     print("  [COT_EST_MIÉRC] Preparando reporte semanal...")
     try:
-        # Calcular ventana de fechas miérc→martes
-        hoy        = ahora.date()
-        miercoles  = hoy - timedelta(days=hoy.weekday() - 2) if hoy.weekday() >= 2 else hoy
-        # El miércoles de esta semana
-        dias_hasta_miercoles = (hoy.weekday() - 2) % 7
-        miercoles_inicio = hoy - timedelta(days=dias_hasta_miercoles)
-        martes_fin       = miercoles_inicio + timedelta(days=6)
+        # Ventana del corte que se valida ESTE viernes:
+        # el corte CFTC fue AYER martes → ventana = miércoles anterior → ayer
+        hoy              = ahora.date()
+        martes_fin       = hoy - timedelta(days=1)        # martes de corte (ayer)
+        miercoles_inicio = martes_fin - timedelta(days=6)  # miércoles anterior
 
         neto_est    = cot_estimado_cache.get("neto_estimado", 0)
         cot_base    = cot_estimado_cache.get("cot_base", 0)
@@ -2951,6 +3612,15 @@ def analizar_con_claude(resultado):
     br_str   = f"Breadth:{br_d.get('verdes',0)}/11 {br_d.get('señal','')}" if br_d.get("disponible") else "Breadth:N/D"
     fg_str   = f"FearGreed:{fg_d.get('valor','N/D')} {fg_d.get('etiqueta','')}" if fg_d.get("disponible") else "FG:N/D"
 
+    g0_d = detalle.get("gex_0dte", {})
+    vc_d = detalle.get("vol_control", {})
+    hy_d = detalle.get("credito_hyg", {})
+    vw_d = detalle.get("vwap", {})
+    g0_str = f"GEX0DTE:{g0_d.get('señal','')}" if g0_d.get("disponible") else "GEX0DTE:N/D"
+    vc_str = f"VolCtl:{vc_d.get('señal','')}"  if vc_d.get("disponible") else "VolCtl:N/D"
+    hy_str = f"HYG:{hy_d.get('señal','')}"     if hy_d.get("disponible") else "HYG:N/D"
+    vw_str = f"VWAP:{vw_d.get('señal','')}"    if vw_d.get("disponible") else "VWAP:N/D"
+
     prompt = f"""Analista cuantitativo US500 intradía v3.9. Score:{score}/10 {direccion}.{' NOTAS: '+notas_str if notas_str else ''}
 
 MACRO ({macro_hora_str}): {macro_impacto} | {macro_noticias} | {macro_resumen} | Sesgo:{macro_sesgo}
@@ -2963,6 +3633,10 @@ TÉCNICO: Precio:{detalle['precio']} RSI:{detalle['rsi']} VIX:{detalle['vix_nive
 SEÑALES INSTITUCIONALES v3.9:
 {cot_str} | {mcl_str} | {vvix_str}
 {pc_str} | {rot_str} | {br_str} | {fg_str}
+
+AVANZADO v4.0:
+{g0_str} | {vc_str}
+{hy_str} | {vw_str}
 
 Rango:{detalle['posicion_rango']['posicion_pct']}% (max:{detalle['posicion_rango']['max_dia']} min:{detalle['posicion_rango']['min_dia']})
 
@@ -3112,6 +3786,15 @@ def enviar_alerta_score(resultado, analisis_claude):
     liq     = detalle["liquidez"]
     liq_str = f"\n🌊 Liquidez: `{liq['nivel']}`" + (" ⚠️" if liq["alerta"] else "")
 
+    extras = []
+    for nom, dd in [("0DTE", detalle.get("gex_0dte", {})),
+                    ("VolCtl", detalle.get("vol_control", {})),
+                    ("HYG", detalle.get("credito_hyg", {})),
+                    ("VWAP", detalle.get("vwap", {}))]:
+        if dd.get("disponible") and dd.get("score", 0) != 0:
+            extras.append(f"{nom}:{dd['score']:+d}")
+    inst2_str = ("\n⚙️ Avanzado: `" + " | ".join(extras) + "`") if extras else ""
+
     macro_impacto = contexto_macro.get("impacto", "NEUTRAL")
     macro_emoji   = {"ALCISTA_FUERTE":"🟢🟢","ALCISTA_MODERADO":"🟢","NEUTRAL":"⚪",
                      "BAJISTA_MODERADO":"🔴","BAJISTA_FUERTE":"🔴🔴"}.get(macro_impacto, "⚪")
@@ -3120,7 +3803,7 @@ def enviar_alerta_score(resultado, analisis_claude):
            f"🕐 Hora: {ahora}\n💵 Precio: `{detalle['precio']:.2f}`\n"
            f"📊 Score: `{barra_score(score)}`\n"
            f"📉 RSI: `{detalle['rsi']}` | VIX: `{detalle['vix_nivel']}`"
-           f"{vix_str}{move_str}{dxy_str}{gex_str}{dp_str}{liq_str}\n"
+           f"{vix_str}{move_str}{dxy_str}{gex_str}{dp_str}{liq_str}{inst2_str}\n"
            f"📍 Rango: `{detalle['posicion_rango']['posicion_pct']}%`\n"
            f"🌍 Macro: {macro_emoji} `{macro_impacto.replace('_',' ')}`{pen_lines}\n"
            f"{'─'*28}\n*Señales activas:*\n{senales_str}")
@@ -3352,6 +4035,7 @@ def cmd_posicion(message):
 estado_mercado_enviado = False
 contador_ciclos        = 0
 cooldown               = EstadoCooldown()
+cot_viernes_procesado  = {"dia": None}   # flag COT real del viernes
 
 def iniciar_polling():
     """Polling con reconexión automática — se reinicia solo si falla."""
@@ -3386,6 +4070,10 @@ print("  [INIT] Calculando McClellan Oscillator...")
 calcular_mcclellan()
 print("  [INIT] Obteniendo Put/Call Ratio...")
 obtener_put_call_ratio()
+print("  [INIT] Cargando journal de señales desde GitHub...")
+cargar_journal_github()
+print("  [INIT] Restaurando estado COT Estimado desde GitHub...")
+cargar_estado_cot_github()
 
 while True:
     try:
@@ -3414,23 +4102,53 @@ while True:
                 gex_niveles["ultima_actualizacion"] = None
                 detector_rango["activo"] = False
                 detector_rango["señales_suspendidas"] = False
+                # Persistir journal de señales del día en GitHub
+                guardar_journal_github()
+                # Persistir estado COT (acumulación del día)
+                guardar_estado_cot_github()
 
             enviar_resumen_dominical()
             monitorear_overnight()
             # Reporte COT Estimado — solo miércoles a las 9:00 ET
             enviar_reporte_cot_estimado_miercoles()
             # ── COT Real CFTC — viernes al cierre (4:00 PM ET = 2:00 PM HN) ──
+            # CFTC publica 3:30 PM ET. Solo intentar DESPUÉS de esa hora
+            # para no quemar el intento en la madrugada con el COT viejo.
             if ahora_ny.weekday() == 4:  # viernes
-                ultima_cot = cot_cache.get("ultima_actualizacion")
-                hoy_ny = ahora_ny.date()
-                if not ultima_cot or ultima_cot.date() != hoy_ny:
+                hora_min_vie = ahora_ny.hour * 60 + ahora_ny.minute
+                if (hora_min_vie >= 15 * 60 + 30 and
+                        cot_viernes_procesado["dia"] != ahora_ny.date()):
                     print("  [COT_VIERNES] 📥 Descargando COT real CFTC...")
                     if obtener_cot_report():
-                        print("  [COT_VIERNES] ✅ COT real actualizado — validando estimado...")
+                        cot_viernes_procesado["dia"] = ahora_ny.date()
+                        print("  [COT_VIERNES] ✅ COT real actualizado")
                         if cot_estimado_cache["disponible"]:
                             validar_cot_estimado_vs_real()
+                            guardar_estado_cot_github()
                         else:
+                            # Sin estimado que validar (primer viernes o reinicio)
+                            # → informar COT real e iniciar acumulación nueva
                             iniciar_acumulacion_cot()
+                            guardar_estado_cot_github()
+                            try:
+                                sesgo_v = cot_cache.get("sesgo", "N/D")
+                                neto_v  = cot_cache.get("neto_largo", 0) or 0
+                                fecha_v = cot_cache.get("fecha_reporte", "N/D")
+                                emoji_v = "🟢" if "ALCISTA" in sesgo_v else ("🔴" if "BAJISTA" in sesgo_v else "⚪")
+                                bot.send_message(TELEGRAM_CHAT_ID,
+                                    f"📊 *COT REAL CFTC — VIERNES*\n"
+                                    f"────────────────────────────\n"
+                                    f"{emoji_v} Sesgo: `{sesgo_v.replace('_',' ')}`\n"
+                                    f"📈 Neto: `{neto_v:+,}` contratos\n"
+                                    f"📅 Fecha corte: `{fecha_v}`\n"
+                                    f"────────────────────────────\n"
+                                    f"🔬 Sin estimado previo que validar.\n"
+                                    f"🚀 Acumulación iniciada — reporte estimado el miércoles, "
+                                    f"validación el próximo viernes.",
+                                    parse_mode="Markdown")
+                                print("  [COT_VIERNES] 📊 COT real enviado (sin validación)")
+                            except Exception as e:
+                                print(f"  [COT_VIERNES] Error enviando: {e}")
             elapsed = time.time() - inicio_ciclo
             time.sleep(max(0, 60 - elapsed))
             contador_ciclos += 1
@@ -3462,6 +4180,8 @@ while True:
         if not estado_mercado_enviado:
             print("  [INIT] Obteniendo niveles GEX REAL...")
             obtener_gex()
+            print("  [INIT] Obteniendo GEX 0DTE...")
+            obtener_gex_0dte()
             print("  [INIT] Obteniendo Dark Pool granular...")
             obtener_dark_pool()
             print("  [INIT] Calculando Breadth sectores...")
@@ -3534,6 +4254,31 @@ while True:
                 print(f"  [GEX] ♻️ Recalculando niveles ({mins_desde_gex:.0f} min desde última actualización)...")
                 obtener_gex()
 
+        # ── Recalcular GEX 0DTE cada 30 minutos ──────────────
+        if TRADIER_TOKEN:
+            if (not gex_0dte_cache["ultima_actualizacion"] or
+                (ahora_ny - gex_0dte_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
+                obtener_gex_0dte()
+
+        # ── Journal: etiquetar señales pendientes (30/60 min) ─
+        verificar_senales_pendientes(spy_precio)
+
+        # ── Ventana CHARM — viernes 14:30-16:00 ET ───────────
+        if ahora_ny.weekday() == 4 and charm_alertado["dia"] != ahora_ny.date():
+            if ahora_ny.hour * 60 + ahora_ny.minute >= 14 * 60 + 30:
+                charm_alertado["dia"] = ahora_ny.date()
+                try:
+                    ctx_opex_ch = contexto_opex()
+                    extra_ch = " — *OPEX HOY, flujo extra fuerte*" if ctx_opex_ch["es_opex_hoy"] else ""
+                    bot.send_message(TELEGRAM_CHAT_ID,
+                        f"🕞 *VENTANA CHARM — Viernes 14:30 ET*{extra_ch}\n"
+                        f"El decay de opciones obliga a dealers a deshacer hedges.\n"
+                        f"⚡ Suele favorecer la tendencia del día hasta el cierre.",
+                        parse_mode="Markdown")
+                    print("  [CHARM] 🕞 Alerta ventana charm enviada")
+                except Exception as e:
+                    print(f"  [CHARM] Error: {e}")
+
         # ── Recalcular Dark Pool cada 30 minutos durante el día ──
         if dark_pool_cache["disponible"] and dark_pool_cache["ultima_actualizacion"]:
             mins_desde_dp = (ahora_ny - dark_pool_cache["ultima_actualizacion"]).total_seconds() / 60
@@ -3559,18 +4304,17 @@ while True:
                 actualizar_cot_estimado()
 
         # ── Alertas proximidad GEX ───────────────────────────
-        if gex_niveles["disponible"] and datos:
+        if gex_niveles["disponible"]:
             try:
-                precio_act = float(datos["spy"].iloc[-1])
-                verificar_proximidad_gex(precio_act * 10)  # convertir SPY a US500
-            except: pass
+                verificar_proximidad_gex(spy_precio)  # ^GSPC ya está en escala US500
+            except Exception as e:
+                print(f"  [GEX_PROX] Error loop: {e}")
 
         # ── Detector squeeze de volatilidad ──────────────────
-        if datos:
-            try:
-                precio_act = float(datos["spy"].iloc[-1]) * 10
-                detectar_squeeze_volatilidad(datos, precio_act)
-            except: pass
+        try:
+            detectar_squeeze_volatilidad(datos, spy_precio)
+        except Exception as e:
+            print(f"  [SQUEEZE] Error loop: {e}")
 
         # ── Options Sweep Detection cada 5 minutos ────────────
         if TRADIER_TOKEN and contador_ciclos % 5 == 0:
@@ -3684,7 +4428,7 @@ while True:
         # ── Divergencia precio-Dark Pool ──────────────────────
         if datos:
             try:
-                div_dp = detectar_divergencia_dark_pool(precio_actual, resultado)
+                div_dp = detectar_divergencia_dark_pool(spy_precio, resultado)
                 if div_dp:
                     emoji_div = "📉" if div_dp == "BAJISTA" else "📈"
                     dp_tend   = dark_pool_cache.get("tendencia", "N/D")
@@ -3753,6 +4497,7 @@ while True:
                 enviar_alerta_score(resultado, analisis)
                 cooldown.registrar_alcista(resultado)
                 activar_detector_agotamiento(resultado)
+                registrar_senal_journal(resultado)
                 print(f"  → ✅ Enviado ({ahora_ny.strftime('%H:%M:%S')} ET)")
             else:
                 print(f"  → ⏸ Alcista {score} bloqueado: {razon}")
@@ -3780,6 +4525,7 @@ while True:
                 enviar_alerta_score(resultado, analisis)
                 cooldown.registrar_bajista(resultado)
                 activar_detector_agotamiento(resultado)
+                registrar_senal_journal(resultado)
                 print(f"  → ✅ Enviado ({ahora_ny.strftime('%H:%M:%S')} ET)")
             else:
                 print(f"  → ⏸ Bajista {score} bloqueado: {razon}")
