@@ -1546,10 +1546,23 @@ pc_semanal_cache = {
 
 
 
-def verificar_proximidad_gex(precio_actual):
+def _regimen_gamma(vix_nivel=None):
+    """
+    Determina si los muros FRENAN (gamma+) o ACELERAN (gamma-).
+    Fuente principal: GEX 0DTE neto. Fallback: VIX.
+    Devuelve (es_positiva, fuente_texto).
+    """
+    if gex_0dte_cache.get("disponible") and gex_0dte_cache.get("neto") is not None:
+        return (gex_0dte_cache["neto"] >= 0, "0DTE")
+    # Fallback por VIX: VIX alto suele implicar gamma negativa (dealers cortos)
+    if vix_nivel is not None:
+        return (vix_nivel < 20, "VIX")
+    return (True, "?")  # default conservador: asumir rebote
+
+def verificar_proximidad_gex(precio_actual, vix_nivel=None):
     """
     Alerta cuando el precio está a 5 puntos del Flip, Call Wall o Put Wall.
-    Da tiempo de preparar entrada antes de que llegue al nivel.
+    Dice explícitamente REBOTE (gamma+) o RUPTURA (gamma-) según el régimen.
     """
     if not gex_niveles["disponible"]:
         return
@@ -1560,30 +1573,52 @@ def verificar_proximidad_gex(precio_actual):
     put_wall   = gex_niveles.get("put_wall")
     UMBRAL_PTS = 5  # puntos US500
 
+    gamma_pos, fuente_reg = _regimen_gamma(vix_nivel)
+
     niveles = [
-        (flip,      "Gamma Flip",  "⚡", "gex_proximidad_cache", "ultima_alerta_flip"),
-        (call_wall, "Call Wall",   "🟢", "gex_proximidad_cache", "ultima_alerta_call_wall"),
-        (put_wall,  "Put Wall",    "🔴", "gex_proximidad_cache", "ultima_alerta_put_wall"),
+        (flip,      "Gamma Flip",  "⚡", "ultima_alerta_flip"),
+        (call_wall, "Call Wall",   "🟢", "ultima_alerta_call_wall"),
+        (put_wall,  "Put Wall",    "🔴", "ultima_alerta_put_wall"),
     ]
 
-    for nivel, nombre, emoji, _, cache_key in niveles:
+    for nivel, nombre, emoji, cache_key in niveles:
         if not nivel:
             continue
         distancia = abs(precio_actual - nivel)
         if distancia <= UMBRAL_PTS:
             ultima = gex_proximidad_cache[cache_key]
-            # Solo alertar si han pasado al menos 15 minutos desde la última alerta de este nivel
             if ultima and (ahora - ultima).total_seconds() / 60 < 15:
                 continue
             gex_proximidad_cache[cache_key] = ahora
             direccion = "↑" if precio_actual < nivel else "↓"
+
+            # ── Lectura explícita según muro + régimen de gamma ──
+            if gamma_pos:
+                regimen_txt = "🟢 Gamma POSITIVA — dealers amortiguan"
+                if nombre == "Call Wall":
+                    pronostico = "🛑 REBOTE probable — el Call Wall suele frenar el alza (resistencia)"
+                elif nombre == "Put Wall":
+                    pronostico = "🛑 REBOTE probable — el Put Wall suele frenar la caída (soporte)"
+                else:  # Gamma Flip
+                    pronostico = "⚖️ Zona de imán — el precio tiende a gravitar aquí"
+            else:
+                regimen_txt = "🔴 Gamma NEGATIVA — dealers amplifican"
+                if nombre == "Call Wall":
+                    pronostico = "🚀 RUPTURA probable — si supera el Call Wall, los dealers impulsan al alza"
+                elif nombre == "Put Wall":
+                    pronostico = "⚠️ RUPTURA probable — si pierde el Put Wall, los dealers aceleran la caída"
+                else:  # Gamma Flip
+                    pronostico = "💥 Cruce de Flip en gamma negativa — movimiento explosivo probable"
+
             try:
                 bot.send_message(TELEGRAM_CHAT_ID,
                     f"{emoji} *PROXIMIDAD {nombre.upper()}*\n"
                     f"Precio: `{precio_actual:.1f}` {direccion} `{nivel}` ({distancia:.1f} pts)\n"
-                    f"⚡ Posible rebote o ruptura inminente.",
+                    f"{regimen_txt} _(fuente: {fuente_reg})_\n"
+                    f"{pronostico}",
                     parse_mode="Markdown")
-                print(f"  [GEX_PROX] {emoji} Alerta {nombre}: {precio_actual:.1f} a {distancia:.1f} pts")
+                print(f"  [GEX_PROX] {emoji} {nombre}: {precio_actual:.1f} a {distancia:.1f} pts | "
+                      f"{'REBOTE' if gamma_pos else 'RUPTURA'} ({fuente_reg})")
             except Exception as e:
                 print(f"  [GEX_PROX] Error: {e}")
 
@@ -4368,7 +4403,7 @@ while True:
         # ── Alertas proximidad GEX ───────────────────────────
         if gex_niveles["disponible"]:
             try:
-                verificar_proximidad_gex(spy_precio)  # ^GSPC ya está en escala US500
+                verificar_proximidad_gex(spy_precio, vix_precio)  # ^GSPC ya en escala US500
             except Exception as e:
                 print(f"  [GEX_PROX] Error loop: {e}")
 
