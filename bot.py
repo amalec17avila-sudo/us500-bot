@@ -190,6 +190,7 @@ cot_estimado_cache = {
     "historial_error":      [],      # % error últimas 4 semanas
     "semana_estimando":     None,    # Semana ISO que estamos estimando
     "fecha_inicio":         None,    # Miércoles desde cuando acumulamos
+    "ultima_fecha_validada": None,   # fecha del último COT ya validado (anti-loop)
     "ultima_actualizacion": None,
 }
 
@@ -213,6 +214,7 @@ def obtener_cot_report():
     Fallback: proxy via /ES=F vs SPY si CFTC no disponible.
     """
     try:
+        import csv, io
         url = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -221,7 +223,9 @@ def obtener_cot_report():
         lineas = contenido.strip().split("\n")
         linea_emini = None
         for linea in lineas:
-            if "E-MINI S&P 500" in linea.upper():
+            # E-MINI S&P 500 puro — excluir Financial/Health/Industrial/etc.
+            U = linea.upper()
+            if U.startswith('"E-MINI S&P 500 -') or U.startswith("E-MINI S&P 500 -"):
                 linea_emini = linea
                 break
 
@@ -229,33 +233,53 @@ def obtener_cot_report():
             print("  [COT] No se encontró E-mini S&P 500 en el CSV")
             return _cot_proxy_fallback()
 
-        campos = linea_emini.split(",")
-        if len(campos) < 10:
-            print("  [COT] CSV con formato inesperado")
+        # csv.reader respeta las comillas del nombre (que contiene comas/guiones)
+        campos = next(csv.reader(io.StringIO(linea_emini)))
+        if len(campos) < 14:
+            print(f"  [COT] CSV con formato inesperado ({len(campos)} campos)")
             return _cot_proxy_fallback()
 
-        fecha_str = campos[2].strip().strip('"')
-        longs_nc  = int(campos[7].strip().replace('"','').replace(',',''))
-        shorts_nc = int(campos[8].strip().replace('"','').replace(',',''))
-        neto      = longs_nc - shorts_nc
+        def _num(i):
+            return int(campos[i].strip().replace('"', '').replace(',', ''))
 
-        if   neto > 150000:  sesgo = "ALCISTA_FUERTE"
-        elif neto > 50000:   sesgo = "ALCISTA_MODERADO"
-        elif neto < -100000: sesgo = "BAJISTA_FUERTE"
-        elif neto < -20000:  sesgo = "BAJISTA_MODERADO"
+        fecha_str = campos[2].strip().strip('"')
+        # ── Mapeo TFF (Traders in Financial Futures) ─────────
+        # [7] OI total | [8/9] Dealer L/S | [10/11] Asset Mgr L/S
+        # [12/13] Leveraged Funds L/S (TIBURONES) | [14/15] Other L/S
+        lev_long   = _num(12)   # Leveraged Funds long  — hedge funds
+        lev_short  = _num(13)   # Leveraged Funds short
+        am_long    = _num(10)   # Asset Managers long   — institucional (contexto)
+        am_short   = _num(11)   # Asset Managers short
+        oi_total   = _num(7)
+
+        neto       = lev_long - lev_short        # NETO de los tiburones
+        neto_am    = am_long - am_short          # neto institucional (contexto)
+
+        # ── Umbrales recalibrados a la escala real de Lev Funds ──
+        # (Lev Funds neto típico E-mini: rango -50k a +150k aprox)
+        if   neto >  100000: sesgo = "ALCISTA_FUERTE"
+        elif neto >   30000: sesgo = "ALCISTA_MODERADO"
+        elif neto <  -80000: sesgo = "BAJISTA_FUERTE"
+        elif neto <  -15000: sesgo = "BAJISTA_MODERADO"
         else:                sesgo = "NEUTRAL"
 
         cot_cache.update({
             "neto_largo":           neto,
             "sesgo":                sesgo,
-            "longs":                longs_nc,
-            "shorts":               shorts_nc,
+            "longs":                lev_long,
+            "shorts":               lev_short,
+            "am_long":              am_long,
+            "am_short":             am_short,
+            "neto_am":              neto_am,
+            "oi_total":             oi_total,
             "ultima_actualizacion": hora_ny(),
             "disponible":           True,
             "fuente":               "CFTC_REAL",
             "fecha_reporte":        fecha_str,
         })
-        print(f"  [COT] ✅ REAL CFTC — Fecha:{fecha_str} | Longs:{longs_nc:,} | Shorts:{shorts_nc:,} | Neto:{neto:+,} | Sesgo:{sesgo}")
+        print(f"  [COT] ✅ REAL CFTC (Lev Funds) — Fecha:{fecha_str} | "
+              f"Long:{lev_long:,} | Short:{lev_short:,} | Neto:{neto:+,} | Sesgo:{sesgo} "
+              f"| AssetMgr neto:{neto_am:+,}")
         return True
 
     except Exception as e:
@@ -655,6 +679,8 @@ def iniciar_acumulacion_cot():
     cot_estimado_cache["cambio_estimado"]   = 0
     cot_estimado_cache["neto_estimado"]     = cot_cache["neto_largo"]
     cot_estimado_cache["disponible"]        = True
+    # Marcar el reporte base como consumido — evita re-validar el mismo COT
+    cot_estimado_cache["ultima_fecha_validada"] = cot_cache.get("fecha_reporte")
 
     # Resetear acumulador para la nueva semana
     cot_senales_semana.update({
@@ -830,6 +856,20 @@ def validar_cot_estimado_vs_real():
     if not cot_cache["disponible"] or not cot_cache["neto_largo"]:
         return
 
+    # ── GUARDA ANTI-REVALIDACIÓN ─────────────────────────────
+    # No validar el mismo reporte CFTC dos veces (evita loop de deploys)
+    fecha_real_actual = cot_cache.get("fecha_reporte")
+    if (fecha_real_actual and
+            cot_estimado_cache.get("ultima_fecha_validada") == fecha_real_actual):
+        print(f"  [COT_EST] ⏭ Ya validado el COT {fecha_real_actual} — sin revalidar")
+        return
+    # No validar un estimado de 0 días (no hubo acumulación real)
+    if cot_senales_semana.get("dias_acumulados", 0) == 0:
+        print("  [COT_EST] ⏭ Estimado de 0 días — solo inicia acumulación, sin validar")
+        cot_estimado_cache["ultima_fecha_validada"] = fecha_real_actual
+        iniciar_acumulacion_cot()
+        return
+
     # El cambio real = COT nuevo - COT base que usamos
     cot_nuevo    = cot_cache["neto_largo"]
     cot_base     = cot_estimado_cache["cot_base"]
@@ -912,6 +952,8 @@ def validar_cot_estimado_vs_real():
     except Exception as e:
         print(f"  [COT_EST] Error enviando validación: {e}")
 
+    # Marcar este COT como validado — no se revalida en próximos deploys
+    cot_estimado_cache["ultima_fecha_validada"] = cot_cache.get("fecha_reporte")
     # Iniciar acumulación para la próxima semana con el nuevo COT como base
     iniciar_acumulacion_cot()
 
@@ -3376,12 +3418,19 @@ def enviar_resumen_dominical():
         cot_neto   = cot_cache.get("neto_largo", 0)
         cot_fuente = cot_cache.get("fuente", "N/D")
         cot_fecha  = cot_cache.get("fecha_reporte", "N/D")
-        # Mostrar longs/shorts si son reales
+        # Mostrar longs/shorts de tiburones (Leveraged Funds) si son reales
         cot_detalle = ""
         if cot_fuente == "CFTC_REAL":
-            longs  = cot_cache.get("longs", 0)
-            shorts = cot_cache.get("shorts", 0)
-            cot_detalle = f"\n   Longs:{longs:,} | Shorts:{shorts:,} | Fecha corte:{cot_fecha}"
+            longs   = cot_cache.get("longs", 0)
+            shorts  = cot_cache.get("shorts", 0)
+            am_l    = cot_cache.get("am_long", 0)
+            am_s    = cot_cache.get("am_short", 0)
+            am_neto = cot_cache.get("neto_am", 0)
+            ratio_lf = (longs / shorts) if shorts else 0
+            ratio_am = (am_l / am_s) if am_s else 0
+            cot_detalle = (f"\n   🦈 Lev Funds — Long:{longs:,} | Short:{shorts:,} | Ratio:{ratio_lf:.2f}"
+                           f"\n   🏛️ Asset Mgr — Long:{am_l:,} | Short:{am_s:,} | Ratio:{ratio_am:.2f} | Neto:{am_neto:+,}"
+                           f"\n   📅 Fecha corte:{cot_fecha}")
         if not gex_niveles["disponible"]: _gex_fallback()
         gex_lunes = ""
         if gex_niveles["disponible"]:
@@ -3406,7 +3455,7 @@ def enviar_resumen_dominical():
             print(f"  [JOURNAL] Error win rates: {e}")
         emoji_cot = "🟢" if "ALCISTA" in cot_sesgo else ("🔴" if "BAJISTA" in cot_sesgo else "⚪")
         msg = (f"📊 *RESUMEN DOMINICAL — Semana {semana_actual}*\n{'─'*28}\n"
-               f"*Posicionamiento Smart Money (COT {cot_fuente}):*\n"
+               f"*Smart Money — Leveraged Funds (COT {cot_fuente}):*\n"
                f"{emoji_cot} Sesgo: `{cot_sesgo}` | Neto: `{cot_neto:+,}` contratos"
                f"{cot_detalle}\n{'─'*28}\n"
                f"*Futuros S&P 500:*\n"
@@ -4133,13 +4182,26 @@ while True:
                             try:
                                 sesgo_v = cot_cache.get("sesgo", "N/D")
                                 neto_v  = cot_cache.get("neto_largo", 0) or 0
+                                long_v  = cot_cache.get("longs", 0) or 0
+                                short_v = cot_cache.get("shorts", 0) or 0
+                                am_l    = cot_cache.get("am_long", 0) or 0
+                                am_s    = cot_cache.get("am_short", 0) or 0
+                                am_v    = cot_cache.get("neto_am", 0) or 0
                                 fecha_v = cot_cache.get("fecha_reporte", "N/D")
                                 emoji_v = "🟢" if "ALCISTA" in sesgo_v else ("🔴" if "BAJISTA" in sesgo_v else "⚪")
+                                ratio_v  = (long_v / short_v) if short_v else 0
+                                ratio_am = (am_l / am_s) if am_s else 0
                                 bot.send_message(TELEGRAM_CHAT_ID,
                                     f"📊 *COT REAL CFTC — VIERNES*\n"
                                     f"────────────────────────────\n"
+                                    f"🦈 *Tiburones (Leveraged Funds):*\n"
                                     f"{emoji_v} Sesgo: `{sesgo_v.replace('_',' ')}`\n"
                                     f"📈 Neto: `{neto_v:+,}` contratos\n"
+                                    f"   Long: `{long_v:,}` | Short: `{short_v:,}` | Ratio: `{ratio_v:.2f}`\n"
+                                    f"────────────────────────────\n"
+                                    f"🏛️ *Asset Managers (institucional):*\n"
+                                    f"   Neto: `{am_v:+,}`\n"
+                                    f"   Long: `{am_l:,}` | Short: `{am_s:,}` | Ratio: `{ratio_am:.2f}`\n"
                                     f"📅 Fecha corte: `{fecha_v}`\n"
                                     f"────────────────────────────\n"
                                     f"🔬 Sin estimado previo que validar.\n"
