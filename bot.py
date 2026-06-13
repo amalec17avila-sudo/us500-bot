@@ -4342,6 +4342,45 @@ while True:
                                f"GEX: {gex_msg.replace('`','').replace('*','').strip() if gex_msg else 'N/D'}")
                     bot.send_message(TELEGRAM_CHAT_ID, fallback)
                 except: pass
+
+            # ── Cheat-sheet del régimen de gamma del día ─────────
+            try:
+                gamma_pos, fuente_reg = _regimen_gamma(vix_precio)
+                neto_0dte = gex_0dte_cache.get("neto") if gex_0dte_cache.get("disponible") else None
+                neto_txt  = f"`{neto_0dte:+,.0f}`" if neto_0dte is not None else "N/D"
+                cw = gex_niveles.get("call_wall", "N/D")
+                pw = gex_niveles.get("put_wall", "N/D")
+                if gamma_pos:
+                    msg_regimen = (
+                        f"🟢 *RÉGIMEN DEL DÍA: GAMMA POSITIVA*\n"
+                        f"_(GEX 0DTE neto: {neto_txt} | fuente: {fuente_reg})_\n"
+                        f"────────────────────────────\n"
+                        f"📌 Mercado *PEGAJOSO* — dealers amortiguan\n"
+                        f"Esperar *RANGO*, movimientos contenidos.\n"
+                        f"────────────────────────────\n"
+                        f"🟢 Call Wall `{cw}` → *resistencia* (rebota abajo)\n"
+                        f"🔴 Put Wall `{pw}` → *soporte* (rebota arriba)\n"
+                        f"🎯 Plan: operar *rebotes* en los walls.\n"
+                        f"El precio tiende a quedar atrapado entre ellos."
+                    )
+                else:
+                    msg_regimen = (
+                        f"🔴 *RÉGIMEN DEL DÍA: GAMMA NEGATIVA*\n"
+                        f"_(GEX 0DTE neto: {neto_txt} | fuente: {fuente_reg})_\n"
+                        f"────────────────────────────\n"
+                        f"📌 Mercado *RESBALOSO* — dealers amplifican\n"
+                        f"Esperar *TENDENCIA*, movimientos explosivos.\n"
+                        f"────────────────────────────\n"
+                        f"🟢 Call Wall `{cw}` → si lo supera, *acelera al alza* 🚀\n"
+                        f"🔴 Put Wall `{pw}` → si lo pierde, *acelera la caída* ⚠️\n"
+                        f"🎯 Plan: operar *rupturas*, no rebotes.\n"
+                        f"⚡ Cuidado: las caídas se retroalimentan."
+                    )
+                bot.send_message(TELEGRAM_CHAT_ID, msg_regimen, parse_mode="Markdown")
+                print(f"  [REGIMEN] ✅ Cheat-sheet enviado — gamma {'POSITIVA' if gamma_pos else 'NEGATIVA'} ({fuente_reg})")
+            except Exception as e:
+                print(f"  [REGIMEN] Error: {e}")
+
             estado_mercado_enviado = True
 
         # ── Recalcular GEX cada 30 minutos durante el día ────
