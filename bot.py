@@ -1360,9 +1360,11 @@ gex_0dte_cache = {
     "neto":                 0.0,
     "neto_anterior":        0.0,
     "flip_0dte":            None,   # en escala US500
+    "flip_confiable":       True,
     "expiracion":           None,
     "ultima_actualizacion": None,
-    "alerta_giro_enviada":  False,
+    "ultimo_giro_signo":    0,      # signo del último giro notificado (+1/-1/0)
+    "ultimo_giro_hora":     None,   # hora del último giro notificado (cooldown)
     "dia":                  None,
 }
 
@@ -1377,7 +1379,7 @@ def obtener_gex_0dte():
         # Reset diario
         if gex_0dte_cache["dia"] != ahora.date():
             gex_0dte_cache.update({"dia": ahora.date(), "neto_anterior": 0.0,
-                                   "alerta_giro_enviada": False})
+                                   "ultimo_giro_signo": 0, "ultimo_giro_hora": None})
 
         url_exp = "https://api.tradier.com/v1/markets/options/expirations?symbol=SPY&includeAllRoots=true"
         req = urllib.request.Request(url_exp, headers={
@@ -1447,33 +1449,59 @@ def obtener_gex_0dte():
         else:
             flip = min(gex_por_strike, key=lambda k: abs(gex_por_strike[k]))
 
+        # ── Validar fiabilidad del flip ──────────────────────
+        # Un flip muy lejos del precio = ruido de Tradier o pocos strikes
+        # válidos en ese ciclo. >40 pts US500 (=4 pts SPY) no es fiable.
+        MAX_DIST_FLIP_SPY = 4.0  # 4 pts SPY = 40 pts US500
+        dist_flip_spy = abs(flip - precio_spy)
+        flip_confiable = dist_flip_spy <= MAX_DIST_FLIP_SPY
+
         neto_ant = gex_0dte_cache.get("neto", 0.0)
         gex_0dte_cache.update({
             "disponible":           True,
             "neto":                 neto,
             "neto_anterior":        neto_ant,
             "flip_0dte":            round(flip * 10, 0),
+            "flip_confiable":       flip_confiable,
             "expiracion":           hoy_str,
             "ultima_actualizacion": ahora,
         })
         regimen = "AMORTIGUA (rango)" if neto > 0 else "AMPLIFICA (tendencia)"
-        print(f"  [GEX_0DTE] ✅ Neto:{neto:+,.0f} | Flip0DTE:{flip*10:.0f} | Dealers: {regimen}")
+        conf_txt = "" if flip_confiable else " ⚠️ FLIP LEJANO (no fiable)"
+        print(f"  [GEX_0DTE] ✅ Neto:{neto:+,.0f} | Flip0DTE:{flip*10:.0f} | "
+              f"Dealers: {regimen}{conf_txt}")
 
-        # Alerta si el neto 0DTE cambia de signo intradía (giro de régimen)
-        if (neto_ant != 0 and neto * neto_ant < 0
-                and not gex_0dte_cache["alerta_giro_enviada"]):
-            gex_0dte_cache["alerta_giro_enviada"] = True
-            nuevo_reg = "🟢 GAMMA POSITIVA — dealers frenarán los movimientos" \
-                        if neto > 0 else "🔴 GAMMA NEGATIVA — dealers amplificarán los movimientos"
-            try:
-                bot.send_message(TELEGRAM_CHAT_ID,
-                    f"⚡ *GIRO DE RÉGIMEN GEX 0DTE*\n"
-                    f"El flujo dealer de HOY cambió de signo.\n{nuevo_reg}\n"
-                    f"Flip 0DTE: `{gex_0dte_cache['flip_0dte']}`",
-                    parse_mode="Markdown")
-                print("  [GEX_0DTE] ⚡ Alerta giro de régimen enviada")
-            except Exception as e:
-                print(f"  [GEX_0DTE] Error alerta: {e}")
+        # ── Alerta de giro de régimen (múltiples por día) ────
+        # Avisa cada vez que el neto 0DTE cambia de signo, siempre que:
+        #  (1) el flip sea confiable (no ruido de Tradier),
+        #  (2) el nuevo signo sea distinto al último ya notificado,
+        #  (3) hayan pasado >=20 min desde la última alerta de giro
+        #      (evita spam si el neto oscila pegado a cero).
+        COOLDOWN_GIRO_MIN = 20
+        if neto_ant != 0 and neto * neto_ant < 0 and flip_confiable:
+            signo_nuevo  = 1 if neto > 0 else -1
+            ultimo_signo = gex_0dte_cache.get("ultimo_giro_signo", 0)
+            ultima_hora  = gex_0dte_cache.get("ultimo_giro_hora")
+            mins_desde   = ((ahora - ultima_hora).total_seconds() / 60
+                            if ultima_hora else 9999)
+            if signo_nuevo != ultimo_signo and mins_desde >= COOLDOWN_GIRO_MIN:
+                gex_0dte_cache["ultimo_giro_signo"] = signo_nuevo
+                gex_0dte_cache["ultimo_giro_hora"]  = ahora
+                nuevo_reg = "🟢 GAMMA POSITIVA — dealers frenarán los movimientos" \
+                            if neto > 0 else "🔴 GAMMA NEGATIVA — dealers amplificarán los movimientos"
+                try:
+                    bot.send_message(TELEGRAM_CHAT_ID,
+                        f"⚡ *GIRO DE RÉGIMEN GEX 0DTE*\n"
+                        f"El flujo dealer de HOY cambió de signo.\n{nuevo_reg}\n"
+                        f"Flip 0DTE: `{gex_0dte_cache['flip_0dte']}`",
+                        parse_mode="Markdown")
+                    print(f"  [GEX_0DTE] ⚡ Alerta giro enviada → {'POSITIVA' if neto>0 else 'NEGATIVA'}")
+                except Exception as e:
+                    print(f"  [GEX_0DTE] Error alerta: {e}")
+            elif signo_nuevo != ultimo_signo:
+                print(f"  [GEX_0DTE] ⏭ Giro real pero en cooldown ({mins_desde:.0f}/{COOLDOWN_GIRO_MIN} min) — no se notifica")
+        elif neto_ant != 0 and neto * neto_ant < 0 and not flip_confiable:
+            print(f"  [GEX_0DTE] ⏭ Giro de signo IGNORADO — flip lejano ({dist_flip_spy*10:.0f} pts US500), probable ruido")
 
     except Exception as e:
         print(f"  [GEX_0DTE] Error: {e}")
@@ -4193,6 +4221,9 @@ while True:
 
             enviar_resumen_dominical()
             monitorear_overnight()
+            # Pre-apertura — la ventana 8:45-9:29 ET cae con mercado CERRADO,
+            # por eso debe ir aquí dentro (antes del continue), no después.
+            enviar_pre_apertura()
             # Reporte COT Estimado — solo miércoles a las 9:00 ET
             enviar_reporte_cot_estimado_miercoles()
             # ── COT Real CFTC — viernes al cierre (4:00 PM ET = 2:00 PM HN) ──
@@ -4250,9 +4281,6 @@ while True:
             time.sleep(max(0, 60 - elapsed))
             contador_ciclos += 1
             continue
-
-        # ── Pre-apertura ─────────────────────────────────────
-        enviar_pre_apertura()
 
         # ── Macro post-evento ─────────────────────────────────
         evento_reciente = detectar_evento_reciente()
@@ -4347,13 +4375,13 @@ while True:
             try:
                 gamma_pos, fuente_reg = _regimen_gamma(vix_precio)
                 neto_0dte = gex_0dte_cache.get("neto") if gex_0dte_cache.get("disponible") else None
-                neto_txt  = f"`{neto_0dte:+,.0f}`" if neto_0dte is not None else "N/D"
+                neto_txt  = f"{neto_0dte:+,.0f}" if neto_0dte is not None else "N/D"
                 cw = gex_niveles.get("call_wall", "N/D")
                 pw = gex_niveles.get("put_wall", "N/D")
                 if gamma_pos:
                     msg_regimen = (
                         f"🟢 *RÉGIMEN DEL DÍA: GAMMA POSITIVA*\n"
-                        f"_(GEX 0DTE neto: {neto_txt} | fuente: {fuente_reg})_\n"
+                        f"GEX 0DTE neto: `{neto_txt}` (fuente: {fuente_reg})\n"
                         f"────────────────────────────\n"
                         f"📌 Mercado *PEGAJOSO* — dealers amortiguan\n"
                         f"Esperar *RANGO*, movimientos contenidos.\n"
@@ -4366,7 +4394,7 @@ while True:
                 else:
                     msg_regimen = (
                         f"🔴 *RÉGIMEN DEL DÍA: GAMMA NEGATIVA*\n"
-                        f"_(GEX 0DTE neto: {neto_txt} | fuente: {fuente_reg})_\n"
+                        f"GEX 0DTE neto: `{neto_txt}` (fuente: {fuente_reg})\n"
                         f"────────────────────────────\n"
                         f"📌 Mercado *RESBALOSO* — dealers amplifican\n"
                         f"Esperar *TENDENCIA*, movimientos explosivos.\n"
@@ -4376,7 +4404,11 @@ while True:
                         f"🎯 Plan: operar *rupturas*, no rebotes.\n"
                         f"⚡ Cuidado: las caídas se retroalimentan."
                     )
-                bot.send_message(TELEGRAM_CHAT_ID, msg_regimen, parse_mode="Markdown")
+                try:
+                    bot.send_message(TELEGRAM_CHAT_ID, msg_regimen, parse_mode="Markdown")
+                except Exception:
+                    bot.send_message(TELEGRAM_CHAT_ID,
+                                     msg_regimen.replace("*", "").replace("`", ""))
                 print(f"  [REGIMEN] ✅ Cheat-sheet enviado — gamma {'POSITIVA' if gamma_pos else 'NEGATIVA'} ({fuente_reg})")
             except Exception as e:
                 print(f"  [REGIMEN] Error: {e}")
