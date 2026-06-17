@@ -1472,13 +1472,15 @@ def obtener_gex_0dte():
               f"Dealers: {regimen}{conf_txt}")
 
         # ── Alerta de giro de régimen (múltiples por día) ────
-        # Avisa cada vez que el neto 0DTE cambia de signo, siempre que:
-        #  (1) el flip sea confiable (no ruido de Tradier),
-        #  (2) el nuevo signo sea distinto al último ya notificado,
-        #  (3) hayan pasado >=20 min desde la última alerta de giro
-        #      (evita spam si el neto oscila pegado a cero).
+        # El RÉGIMEN lo define el NETO (suma de gamma), que es robusto.
+        # El flip es solo un nivel de referencia: si sale ruidoso (lejano),
+        # NO bloqueamos el giro — solo lo omitimos del mensaje.
+        # Condiciones para alertar:
+        #  (1) el neto cambió de signo,
+        #  (2) el nuevo signo es distinto al último notificado,
+        #  (3) pasaron >=20 min desde la última alerta (anti-spam).
         COOLDOWN_GIRO_MIN = 20
-        if neto_ant != 0 and neto * neto_ant < 0 and flip_confiable:
+        if neto_ant != 0 and neto * neto_ant < 0:
             signo_nuevo  = 1 if neto > 0 else -1
             ultimo_signo = gex_0dte_cache.get("ultimo_giro_signo", 0)
             ultima_hora  = gex_0dte_cache.get("ultimo_giro_hora")
@@ -1489,19 +1491,22 @@ def obtener_gex_0dte():
                 gex_0dte_cache["ultimo_giro_hora"]  = ahora
                 nuevo_reg = "🟢 GAMMA POSITIVA — dealers frenarán los movimientos" \
                             if neto > 0 else "🔴 GAMMA NEGATIVA — dealers amplificarán los movimientos"
+                # Mostrar el flip solo si es confiable; si no, omitirlo
+                if flip_confiable:
+                    flip_linea = f"\nFlip 0DTE: `{gex_0dte_cache['flip_0dte']}`"
+                else:
+                    flip_linea = "\n_(Flip 0DTE no fiable este ciclo — omitido)_"
                 try:
                     bot.send_message(TELEGRAM_CHAT_ID,
                         f"⚡ *GIRO DE RÉGIMEN GEX 0DTE*\n"
-                        f"El flujo dealer de HOY cambió de signo.\n{nuevo_reg}\n"
-                        f"Flip 0DTE: `{gex_0dte_cache['flip_0dte']}`",
+                        f"El flujo dealer de HOY cambió de signo.\n{nuevo_reg}{flip_linea}",
                         parse_mode="Markdown")
-                    print(f"  [GEX_0DTE] ⚡ Alerta giro enviada → {'POSITIVA' if neto>0 else 'NEGATIVA'}")
+                    print(f"  [GEX_0DTE] ⚡ Alerta giro enviada → {'POSITIVA' if neto>0 else 'NEGATIVA'}"
+                          f"{' (flip omitido)' if not flip_confiable else ''}")
                 except Exception as e:
                     print(f"  [GEX_0DTE] Error alerta: {e}")
             elif signo_nuevo != ultimo_signo:
                 print(f"  [GEX_0DTE] ⏭ Giro real pero en cooldown ({mins_desde:.0f}/{COOLDOWN_GIRO_MIN} min) — no se notifica")
-        elif neto_ant != 0 and neto * neto_ant < 0 and not flip_confiable:
-            print(f"  [GEX_0DTE] ⏭ Giro de signo IGNORADO — flip lejano ({dist_flip_spy*10:.0f} pts US500), probable ruido")
 
     except Exception as e:
         print(f"  [GEX_0DTE] Error: {e}")
@@ -3361,20 +3366,27 @@ def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
     hora_et = ahora.hour * 60 + ahora.minute
-    if not (8 * 60 + 45 <= hora_et <= 9 * 60 + 29): return  # 8:45-9:29 ET
-    print("  [PRE-APERTURA] Preparando contexto...")
+    if not (8 * 60 + 30 <= hora_et <= 9 * 60 + 29): return  # 8:30-9:29 ET (ampliada)
+    print(f"  [PRE-APERTURA] Preparando contexto... (hora_et={hora_et//60}:{hora_et%60:02d})")
     try:
-        es_data       = descargar_futuros(period="2d", interval="5m")
+        try:
+            es_data       = descargar_futuros(period="2d", interval="5m")
+        except Exception as ef:
+            print(f"  [PRE-APERTURA] Error futuros: {ef}")
+            es_data = pd.DataFrame()
         if not es_data.empty:
             close_es = es_data["Close"]
             if hasattr(close_es, "columns"): close_es = close_es.iloc[:, 0]
-            close_es = close_es.squeeze()
-            if hasattr(close_es, "values"): close_es = close_es.squeeze()
-            futuro_precio = float(close_es.values[-1]) if hasattr(close_es, "values") else float(close_es.iloc[-1])
-            if len(close_es) >= 12:
-                futuro_cambio = float((close_es.values[-1] / close_es.values[-12] - 1) * 100) if hasattr(close_es, "values") else 0.0
-            else:
-                futuro_cambio = 0.0
+            close_es = close_es.squeeze().dropna()
+            try:
+                futuro_precio = float(close_es.iloc[-1])
+                if len(close_es) >= 12:
+                    futuro_cambio = float((close_es.iloc[-1] / close_es.iloc[-12] - 1) * 100)
+                else:
+                    futuro_cambio = 0.0
+            except Exception as ep:
+                print(f"  [PRE-APERTURA] Error procesando futuros: {ep}")
+                futuro_precio = 0; futuro_cambio = 0.0
         else:
             futuro_precio = 0; futuro_cambio = 0.0
         cot_info  = cot_cache
@@ -3390,12 +3402,16 @@ def enviar_pre_apertura():
         if not breadth_cache["disponible"]: calcular_breadth_sectores()
         breadth_texto = f"Breadth: {breadth_cache.get('verdes',0)}/11 sectores en verde" \
                        if breadth_cache["disponible"] else "Breadth: N/D"
-        vix_d  = yf.download("^VIX", period="2d", interval="1d", progress=False)
-        if not vix_d.empty:
-            vix_close = vix_d["Close"]
-            if hasattr(vix_close, "columns"): vix_close = vix_close.iloc[:, 0]
-            vix_n = float(vix_close.squeeze().iloc[-1])
-        else:
+        try:
+            vix_d  = yf.download("^VIX", period="2d", interval="1d", progress=False)
+            if not vix_d.empty:
+                vix_close = vix_d["Close"]
+                if hasattr(vix_close, "columns"): vix_close = vix_close.iloc[:, 0]
+                vix_n = float(vix_close.squeeze().iloc[-1])
+            else:
+                vix_n = 20
+        except Exception as ev:
+            print(f"  [PRE-APERTURA] Error VIX: {ev}")
             vix_n = 20
         fg     = calcular_fear_greed(vix_n, {"disponible": False}, {"disponible": False})
         fg_texto   = f"Fear/Greed: {fg['valor']} — {fg['etiqueta']}"
@@ -3450,7 +3466,10 @@ def enviar_pre_apertura():
                f"{gex_texto}"
                f"{opex_texto}"
                f"{calendario_texto}")
-        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        try:
+            bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
+        except Exception:
+            bot.send_message(TELEGRAM_CHAT_ID, msg.replace("*","").replace("`",""))
         pre_apertura_enviado["dia"] = ahora.date()
         print("  [PRE-APERTURA] ✅ Enviado")
     except Exception as e:
