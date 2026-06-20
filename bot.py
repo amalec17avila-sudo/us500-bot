@@ -3535,8 +3535,8 @@ def obtener_calendario_economico():
 def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
-    if es_festivo_hoy():  # festivo NYSE — no hay sesión, no mandar pre-market
-        print("  [PRE-APERTURA] ⏭ Hoy es festivo NYSE — sin pre-apertura")
+    if not es_dia_habil(ahora.date()):  # fin de semana O festivo NYSE — sin sesión
+        print("  [PRE-APERTURA] ⏭ Hoy no es día hábil (fin de semana o festivo) — sin pre-apertura")
         return
     hora_et = ahora.hour * 60 + ahora.minute
     if not (8 * 60 + 30 <= hora_et <= 9 * 60 + 29): return  # 8:30-9:29 ET (ampliada)
