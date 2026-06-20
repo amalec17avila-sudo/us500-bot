@@ -1672,6 +1672,7 @@ gex_proximidad_cache = {
     "ultima_alerta_flip":      None,
     "ultima_alerta_call_wall": None,
     "ultima_alerta_put_wall":  None,
+    "ultima_alerta_flip_0dte": None,
 }
 
 # Estado para detector de squeeze de volatilidad
@@ -1779,6 +1780,50 @@ def verificar_proximidad_gex(precio_actual, vix_nivel=None):
                       f"{'REBOTE' if gamma_pos else 'RUPTURA'} ({fuente_reg})")
             except Exception as e:
                 print(f"  [GEX_PROX] Error: {e}")
+
+    # ── Proximidad al FLIP 0DTE (nivel intradía separado del semanal) ──
+    # El flip 0DTE es el gatillo de aceleración del día — distinto del
+    # flip semanal estructural de arriba. Solo se alerta si es confiable
+    # (no lejano/ruidoso) y el precio está dentro del umbral.
+    try:
+        if (gex_0dte_cache.get("disponible") and
+                gex_0dte_cache.get("flip_0dte") and
+                gex_0dte_cache.get("flip_confiable", False)):
+            flip_0dte = gex_0dte_cache["flip_0dte"]
+            dist_0dte = abs(precio_actual - flip_0dte)
+            if dist_0dte <= UMBRAL_PTS:
+                ultima_0dte = gex_proximidad_cache["ultima_alerta_flip_0dte"]
+                if not (ultima_0dte and (ahora - ultima_0dte).total_seconds() / 60 < 15):
+                    gex_proximidad_cache["ultima_alerta_flip_0dte"] = ahora
+                    dir_0dte = "↑" if precio_actual < flip_0dte else "↓"
+                    neto_0dte = gex_0dte_cache.get("neto", 0)
+                    # El flip 0DTE define el régimen por sí mismo (su neto)
+                    if neto_0dte >= 0:
+                        reg_0dte = "🟢 Gamma 0DTE POSITIVA — sobre el flip los dealers soportan"
+                        pron_0dte = ("⚖️ Cerca del flip 0DTE — zona de decisión intradía.\n"
+                                     "Sobre el flip: soporte. Bajo el flip: presión.")
+                    else:
+                        reg_0dte = "🔴 Gamma 0DTE NEGATIVA — dealers amplifican el cruce"
+                        pron_0dte = ("💥 GATILLO DE ACELERACIÓN — un cruce decidido del flip 0DTE\n"
+                                     "suele disparar movimiento explosivo en la dirección del cruce.\n"
+                                     "⚠️ Ojo con cruces falsos: esperá que lo atraviese con convicción.")
+                    try:
+                        bot.send_message(TELEGRAM_CHAT_ID,
+                            f"⚡ *PROXIMIDAD FLIP 0DTE* (intradía)\n"
+                            f"Precio: `{precio_actual:.1f}` {dir_0dte} `{flip_0dte:.0f}` ({dist_0dte:.1f} pts)\n"
+                            f"{reg_0dte}\n"
+                            f"{pron_0dte}",
+                            parse_mode="Markdown")
+                        print(f"  [GEX_PROX] ⚡ FLIP 0DTE: {precio_actual:.1f} a {dist_0dte:.1f} pts del flip 0DTE {flip_0dte:.0f}")
+                    except Exception as e:
+                        print(f"  [GEX_PROX] Error flip 0DTE: {e}")
+        elif (gex_0dte_cache.get("disponible") and
+              gex_0dte_cache.get("flip_0dte") and
+              not gex_0dte_cache.get("flip_confiable", True)):
+            # Flip 0DTE lejano/ruidoso — no alertar (evita falsos cruces)
+            pass
+    except Exception as e:
+        print(f"  [GEX_PROX] Error bloque flip 0DTE: {e}")
 
 
 def detectar_squeeze_volatilidad(datos, precio_actual):
