@@ -152,6 +152,37 @@ def minutos_desde_apertura():
     apertura = ahora.replace(hour=9, minute=30, second=0, microsecond=0)
     return max(0, int((ahora - apertura).total_seconds() / 60))
 
+def es_dia_habil(fecha):
+    """True si la fecha NO es fin de semana ni festivo NYSE."""
+    if fecha.weekday() > 4:
+        return False
+    if (fecha.year, fecha.month, fecha.day) in NYSE_FESTIVOS:
+        return False
+    return True
+
+def es_festivo_hoy():
+    """True si HOY es festivo NYSE (no fin de semana, sino festivo federal)."""
+    ahora = hora_ny()
+    return (ahora.year, ahora.month, ahora.day) in NYSE_FESTIVOS
+
+def proximo_dia_habil_texto():
+    """
+    Devuelve el texto del próximo día hábil para el mensaje de cierre.
+    Salta fines de semana Y festivos. Ej: 'mañana', 'el lunes', 'el martes'.
+    """
+    ahora = hora_ny()
+    dias_es = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    # Buscar el próximo día hábil empezando por mañana
+    siguiente = ahora.date() + timedelta(days=1)
+    intentos = 0
+    while not es_dia_habil(siguiente) and intentos < 10:
+        siguiente += timedelta(days=1)
+        intentos += 1
+    # Si el próximo hábil es literalmente mañana → "mañana"
+    if siguiente == ahora.date() + timedelta(days=1):
+        return "mañana"
+    return f"el {dias_es[siguiente.weekday()]}"
+
 # ================================================================
 # === MEJORA A: COT REAL CFTC =====================================
 # ================================================================
@@ -989,7 +1020,17 @@ gex_niveles = {
     "disponible":           False,
     "es_estimado":          True,
     "fuente":               None,
+    # OI y prima aproximada en cada wall (se llenan si hay datos de Tradier)
+    "call_wall_oi":         None,
+    "call_wall_prima":      None,
+    "put_wall_oi":          None,
+    "put_wall_prima":       None,
 }
+
+# OI y precio por strike SPY del ciclo actual (para mostrar OI en los walls).
+# Solo se llena cuando la fuente es Tradier (trae open_interest + precio).
+# Clave: strike (float, escala SPY) → {"call_oi", "put_oi", "call_px", "put_px"}
+oi_por_strike_cache = {"data": {}, "fuente": None}
 
 
 def _obtener_gex_tradier(precio_spy):
@@ -1043,6 +1084,10 @@ def _obtener_gex_tradier(precio_spy):
                 if not opciones:
                     continue
 
+                # Reiniciar el cache de OI por strike para este ciclo
+                oi_por_strike_cache["data"]   = {}
+                oi_por_strike_cache["fuente"]  = "TRADIER"
+
                 for opcion in opciones:
                     strike    = float(opcion.get("strike", 0))
                     oi        = float(opcion.get("open_interest", 0))
@@ -1056,12 +1101,32 @@ def _obtener_gex_tradier(precio_spy):
                     if gamma <= 0:
                         continue
 
+                    # Precio de la opción: last si existe, sino punto medio bid/ask
+                    px_last = float(opcion.get("last", 0) or 0)
+                    px_bid  = float(opcion.get("bid", 0) or 0)
+                    px_ask  = float(opcion.get("ask", 0) or 0)
+                    if px_last > 0:
+                        precio_op = px_last
+                    elif px_bid > 0 and px_ask > 0:
+                        precio_op = (px_bid + px_ask) / 2
+                    else:
+                        precio_op = px_bid or px_ask or 0.0
+
+                    # Guardar OI + precio por strike (acumula varias expiraciones)
+                    reg = oi_por_strike_cache["data"].setdefault(
+                        strike, {"call_oi": 0.0, "put_oi": 0.0,
+                                 "call_px": 0.0, "put_px": 0.0})
+
                     gex = gamma * oi * 100 * strike
 
                     if tipo == "call":
                         gex_por_strike[strike] = gex_por_strike.get(strike, 0) + gex
+                        reg["call_oi"] += oi
+                        if precio_op > 0: reg["call_px"] = precio_op
                     elif tipo == "put":
                         gex_por_strike[strike] = gex_por_strike.get(strike, 0) - gex
+                        reg["put_oi"] += oi
+                        if precio_op > 0: reg["put_px"] = precio_op
 
                     strikes_procesados += 1
 
@@ -1248,6 +1313,22 @@ def _procesar_gex(gex_por_strike, precio_spy, precio_us500, fuente):
         if not gamma_flip_us500:
             return _gex_fallback()
 
+        # ── OI y prima aproximada en cada wall (si hay datos Tradier) ──
+        # call_wall y put_wall están en escala SPY = claves del cache.
+        cw_oi = cw_prima = pw_oi = pw_prima = None
+        if oi_por_strike_cache.get("fuente") == "TRADIER" and oi_por_strike_cache["data"]:
+            if call_wall is not None:
+                reg_cw = oi_por_strike_cache["data"].get(call_wall)
+                if reg_cw:
+                    cw_oi    = int(reg_cw["call_oi"])
+                    # Prima aproximada = precio opción × OI × 100 (multiplicador)
+                    cw_prima = reg_cw["call_px"] * reg_cw["call_oi"] * 100
+            if put_wall is not None:
+                reg_pw = oi_por_strike_cache["data"].get(put_wall)
+                if reg_pw:
+                    pw_oi    = int(reg_pw["put_oi"])
+                    pw_prima = reg_pw["put_px"] * reg_pw["put_oi"] * 100
+
         gex_niveles.update({
             "gamma_flip":           gamma_flip_us500,
             "call_wall":            call_wall_us500,
@@ -1257,13 +1338,57 @@ def _procesar_gex(gex_por_strike, precio_spy, precio_us500, fuente):
             "es_estimado":          False,
             "fuente":               fuente,
             "strikes_totales":      len(gex_filtrado),
+            "call_wall_oi":         cw_oi,
+            "call_wall_prima":      cw_prima,
+            "put_wall_oi":          pw_oi,
+            "put_wall_prima":       pw_prima,
         })
-        print(f"  [GEX] ✅ {fuente} — Flip:{gamma_flip_us500} | Call:{call_wall_us500} | Put:{put_wall_us500} | Strikes:{len(gex_filtrado)}")
+        oi_txt = ""
+        if cw_oi is not None or pw_oi is not None:
+            oi_txt = f" | OI Call:{cw_oi or 0:,} Put:{pw_oi or 0:,}"
+        print(f"  [GEX] ✅ {fuente} — Flip:{gamma_flip_us500} | Call:{call_wall_us500} | Put:{put_wall_us500} | Strikes:{len(gex_filtrado)}{oi_txt}")
         return True
 
     except Exception as e:
         print(f"  [GEX] _procesar_gex error: {e}")
         return _gex_fallback()
+
+def texto_oi_walls():
+    """
+    Devuelve texto con el OI (contratos) y prima aproximada en cada wall.
+    Solo si hay datos de Tradier. Marca la prima como aproximación.
+    Formato similar al sweep: contratos + monto en dólares.
+    """
+    if not gex_niveles.get("disponible"):
+        return ""
+    cw_oi    = gex_niveles.get("call_wall_oi")
+    cw_prima = gex_niveles.get("call_wall_prima")
+    pw_oi    = gex_niveles.get("put_wall_oi")
+    pw_prima = gex_niveles.get("put_wall_prima")
+    if cw_oi is None and pw_oi is None:
+        return ""  # sin datos de OI (fuente no-Tradier)
+    lineas = ["\n📊 *OI en los muros* (prima ≈ aprox.):"]
+    if cw_oi is not None:
+        cw = gex_niveles.get("call_wall", "N/D")
+        if cw_prima and cw_prima > 0:
+            lineas.append(f"🟢 Call Wall `{cw}`: `{cw_oi:,}` contratos — ≈`${cw_prima:,.0f}`")
+        else:
+            lineas.append(f"🟢 Call Wall `{cw}`: `{cw_oi:,}` contratos")
+    if pw_oi is not None:
+        pw = gex_niveles.get("put_wall", "N/D")
+        if pw_prima and pw_prima > 0:
+            lineas.append(f"🔴 Put Wall `{pw}`: `{pw_oi:,}` contratos — ≈`${pw_prima:,.0f}`")
+        else:
+            lineas.append(f"🔴 Put Wall `{pw}`: `{pw_oi:,}` contratos")
+    # Balance neto de OI (cuál muro tiene más contratos)
+    if cw_oi is not None and pw_oi is not None:
+        if cw_oi > pw_oi:
+            lineas.append(f"⚖️ Neto OI: Call domina (+{cw_oi - pw_oi:,} contratos)")
+        elif pw_oi > cw_oi:
+            lineas.append(f"⚖️ Neto OI: Put domina (+{pw_oi - cw_oi:,} contratos)")
+        else:
+            lineas.append("⚖️ Neto OI: equilibrado")
+    return "\n".join(lineas)
 
 def _gex_fallback():
     """Fallback: intenta FlashAlpha, luego estimado geométrico."""
@@ -3365,6 +3490,9 @@ def obtener_calendario_economico():
 def enviar_pre_apertura():
     ahora = hora_ny()
     if pre_apertura_enviado["dia"] == ahora.date(): return
+    if es_festivo_hoy():  # festivo NYSE — no hay sesión, no mandar pre-market
+        print("  [PRE-APERTURA] ⏭ Hoy es festivo NYSE — sin pre-apertura")
+        return
     hora_et = ahora.hour * 60 + ahora.minute
     if not (8 * 60 + 30 <= hora_et <= 9 * 60 + 29): return  # 8:30-9:29 ET (ampliada)
     print(f"  [PRE-APERTURA] Preparando contexto... (hora_et={hora_et//60}:{hora_et%60:02d})")
@@ -4219,10 +4347,11 @@ while True:
                 spy_temp = descargar_datos()
                 if spy_temp:
                     precio_final = float(spy_temp["close"]["^GSPC"].iloc[-1])
+                    despedida = proximo_dia_habil_texto()
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"🔕 *MERCADO CERRADO — US500 v3.9*\n"
-                            f"US500 final: `{precio_final:.2f}`\nHasta mañana. 🌙",
+                            f"US500 final: `{precio_final:.2f}`\nNos vemos {despedida}. 🌙",
                             parse_mode="Markdown")
                     except:
                         bot.send_message(TELEGRAM_CHAT_ID,
@@ -4251,7 +4380,8 @@ while True:
             if ahora_ny.weekday() == 4:  # viernes
                 hora_min_vie = ahora_ny.hour * 60 + ahora_ny.minute
                 if (hora_min_vie >= 15 * 60 + 30 and
-                        cot_viernes_procesado["dia"] != ahora_ny.date()):
+                        cot_viernes_procesado["dia"] != ahora_ny.date() and
+                        not es_festivo_hoy()):   # festivo federal → CFTC no publica
                     print("  [COT_VIERNES] 📥 Descargando COT real CFTC...")
                     if obtener_cot_report():
                         cot_viernes_procesado["dia"] = ahora_ny.date()
@@ -4423,6 +4553,11 @@ while True:
                         f"🎯 Plan: operar *rupturas*, no rebotes.\n"
                         f"⚡ Cuidado: las caídas se retroalimentan."
                     )
+                # Añadir OI en los muros si hay datos
+                try:
+                    msg_regimen += texto_oi_walls()
+                except Exception:
+                    pass
                 try:
                     bot.send_message(TELEGRAM_CHAT_ID, msg_regimen, parse_mode="Markdown")
                 except Exception:
@@ -4538,6 +4673,20 @@ while True:
                         puts_txt  = (f"🔴 PUTS: `{sweep['contratos_puts']:,}` contratos "
                                     f"({sweep['strikes_puts']} strikes) — `${sweep['prima_puts']:,.0f}`\n")
 
+                    # En días OPEX/triple witching el pinning a los walls
+                    # neutraliza el efecto de los sweeps — advertir de no fiarse.
+                    cierre_sweep = f"⚡ Movimiento {direccion} probable en 15-30 min."
+                    try:
+                        _ctx_op = contexto_opex()
+                        if _ctx_op["es_opex_hoy"]:
+                            _tw = "triple witching" if _ctx_op["es_triple"] else "OPEX"
+                            cierre_sweep = (f"⚠️ HOY es {_tw} — el pinning a los walls suele "
+                                            f"anular el efecto de los sweeps.\n"
+                                            f"NO fiarse del balance para predecir dirección hoy "
+                                            f"(aunque el monto sea alto).")
+                    except Exception:
+                        pass
+
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"{emoji} *SWEEP INSTITUCIONAL DETECTADO*\n"
@@ -4546,7 +4695,7 @@ while True:
                             f"────────────────────────────\n"
                             f"📊 Balance neto: *{direccion}* `${sweep['balance_neto']:,.0f}`\n"
                             f"📅 Expiración: `{sweep['expiracion']}`\n"
-                            f"⚡ Movimiento {direccion} probable en 15-30 min.",
+                            f"{cierre_sweep}",
                             parse_mode="Markdown")
                         print(f"  [SWEEP] {emoji} Alerta {direccion} enviada — balance ${sweep['balance_neto']:,.0f}")
                     except Exception as e:
@@ -4670,13 +4819,21 @@ while True:
                                   sweep_cache["tipo"] == "ALCISTA" and
                                   (ahora_ny - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 30)
                 if sweep_reciente:
+                    _nota_pin = ""
+                    try:
+                        _c = contexto_opex()
+                        if _c["es_opex_hoy"]:
+                            _nota_pin = ("\n⚠️ Día de vencimiento (pinning) — la confirmación "
+                                         "pierde fuerza, no fiarse del balance hoy.")
+                    except Exception:
+                        pass
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"🔥 *CONFIRMACIÓN INSTITUCIONAL ALCISTA*\n"
                             f"Score +{score}/10 + Sweep ALCISTA detectado\n"
                             f"📊 {sweep_cache['contratos_calls']:,} calls vs {sweep_cache['contratos_puts']:,} puts\n"
                             f"💰 Balance neto: `${sweep_cache['prima_total']:,.0f}`\n"
-                            f"⚡ Señal de alta convicción institucional.",
+                            f"⚡ Señal de alta convicción institucional.{_nota_pin}",
                             parse_mode="Markdown")
                         print("  [SWEEP+SCORE] 🔥 Confirmación institucional alcista enviada")
                     except Exception as e:
@@ -4698,13 +4855,21 @@ while True:
                                   sweep_cache["tipo"] == "BAJISTA" and
                                   (ahora_ny - sweep_cache["ultimo_sweep"]).total_seconds() / 60 <= 30)
                 if sweep_reciente:
+                    _nota_pin = ""
+                    try:
+                        _c = contexto_opex()
+                        if _c["es_opex_hoy"]:
+                            _nota_pin = ("\n⚠️ Día de vencimiento (pinning) — la confirmación "
+                                         "pierde fuerza, no fiarse del balance hoy.")
+                    except Exception:
+                        pass
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"🔥 *CONFIRMACIÓN INSTITUCIONAL BAJISTA*\n"
                             f"Score -{abs(score)}/10 + Sweep BAJISTA detectado\n"
                             f"📊 {sweep_cache['contratos_puts']:,} puts vs {sweep_cache['contratos_calls']:,} calls\n"
                             f"💰 Balance neto: `${sweep_cache['prima_total']:,.0f}`\n"
-                            f"⚡ Señal de alta convicción institucional.",
+                            f"⚡ Señal de alta convicción institucional.{_nota_pin}",
                             parse_mode="Markdown")
                         print("  [SWEEP+SCORE] 🔥 Confirmación institucional bajista enviada")
                     except Exception as e:
