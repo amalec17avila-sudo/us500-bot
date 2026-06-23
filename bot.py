@@ -371,6 +371,28 @@ cme_oi_cache = {
     "ultima_actualizacion": None,
 }
 
+# ════════════════════════════════════════════════════════════════
+# ÍNDICE DE POSICIONAMIENTO DE TIBURONES 🦈
+# Infiere el sesgo de los Leveraged Funds por CAUSA-EFECTO: si los
+# tiburones se posicionan, dejan huellas observables. Combina las
+# huellas en un sesgo direccional con confluencia (NO un número de
+# contratos — eso es imposible de replicar sin los datos privados
+# de la CFTC). Cada huella vota dirección + fuerza; suma ponderada
+# da el sesgo; la dispersión distingue neutral-consenso de
+# neutral-conflicto.
+# ════════════════════════════════════════════════════════════════
+indice_tiburones_cache = {
+    "disponible":     False,
+    "sesgo":          None,     # ALCISTA / BAJISTA / NEUTRAL
+    "tipo_neutral":   None,     # "consenso" / "conflicto" / None
+    "score":          0.0,      # suma ponderada de votos (-1 a +1 aprox)
+    "confluencia":    0,        # cuántas huellas activas votan igual
+    "huellas_activas":0,        # cuántas huellas tienen dato hoy
+    "confianza":      "BAJA",   # ALTA / MEDIA / BAJA
+    "huellas":        {},       # detalle por huella: {nombre: {voto, fuerza, texto}}
+    "ultima_actualizacion": None,
+}
+
 def obtener_cme_oi():
     """
     Lee el Open Interest diario de E-Mini S&P 500 desde GitHub.
@@ -730,10 +752,13 @@ def iniciar_acumulacion_cot():
 
 def acumular_senales_cot():
     """
-    Acumula señales diarias para el COT estimado.
-    Se llama al cambio de día (lunes-viernes).
-    Solo acumula si hay una estimación activa iniciada el viernes anterior.
+    JUBILADA (sesión 22-jun): reemplazada por el Índice de Tiburones.
+    El COT estimado viejo producía un número de contratos imposible de
+    replicar (+915,218 vs real +57,307). Se conserva la firma para no
+    romper las llamadas del loop, pero no hace nada.
     """
+    return
+    # --- código viejo deshabilitado debajo ---
     global cot_senales_semana
 
     if not cot_estimado_cache["disponible"]:
@@ -775,10 +800,11 @@ def acumular_senales_cot():
 
 def actualizar_cot_estimado():
     """
-    Recalcula el COT estimado cada 30 minutos usando señales acumuladas.
-    Fórmula: CAMBIO_ESTIMADO = ajuste_sweep + ajuste_dp + ajuste_pc + ajuste_rotacion
-             COT_ESTIMADO    = COT_BASE + CAMBIO_ESTIMADO
+    JUBILADA (sesión 22-jun): reemplazada por el Índice de Tiburones.
+    Se conserva la firma para no romper llamadas del loop.
     """
+    return
+    # --- código viejo deshabilitado debajo ---
     global cot_estimado_cache
 
     if not cot_estimado_cache["disponible"]:
@@ -874,119 +900,270 @@ def actualizar_cot_estimado():
           f"Estimado:{neto_estimado:+,} | Días:{dias_acc} | Confianza:{confianza:.0%}")
 
 
+# ════════════════════════════════════════════════════════════════
+# ÍNDICE DE POSICIONAMIENTO DE TIBURONES — cálculo de las huellas
+# ════════════════════════════════════════════════════════════════
+def _huella_basis():
+    """
+    Huella 5: Basis = futuro /ES vs spot ^GSPC.
+    Futuro caro vs spot (contango fuerte) → presión compradora en
+    futuros (donde juegan los hedge funds) → voto ALCISTA.
+    Futuro barato vs spot (backwardation) → presión vendedora → BAJISTA.
+    yfinance da ambos limpios.
+    """
+    try:
+        es  = yf.download("ES=F",  period="2d", interval="1d", progress=False)
+        spx = yf.download("^GSPC", period="2d", interval="1d", progress=False)
+        if es.empty or spx.empty:
+            return None
+        es_close  = float(es["Close"].squeeze().iloc[-1])
+        spx_close = float(spx["Close"].squeeze().iloc[-1])
+        # Basis en puntos. El futuro normalmente cotiza con una pequeña
+        # prima por costo de acarreo; lo relevante es la DESVIACIÓN.
+        basis = es_close - spx_close
+        # Normalizar como % del índice para juzgar magnitud
+        basis_pct = basis / spx_close * 100
+        # Umbral: >0.15% prima fuerte = alcista; <-0.05% descuento = bajista
+        if basis_pct > 0.15:
+            return {"voto": +1, "fuerza": min(1.0, basis_pct / 0.30),
+                    "texto": f"futuro caro +{basis:.1f}pts (presión compradora)"}
+        elif basis_pct < -0.05:
+            return {"voto": -1, "fuerza": min(1.0, abs(basis_pct) / 0.20),
+                    "texto": f"futuro barato {basis:.1f}pts (presión vendedora)"}
+        else:
+            return {"voto": 0, "fuerza": 0.2,
+                    "texto": f"basis neutro {basis:+.1f}pts"}
+    except Exception as e:
+        print(f"  [TIBURONES] Error basis: {e}")
+        return None
+
+
+def _huella_volumen_futuros():
+    """
+    Huella 2: Volumen direccional de futuros /ES.
+    Volumen alto + vela alcista → institucionales comprando con tamaño.
+    Volumen alto + vela bajista → vendiendo con tamaño.
+    yfinance da volumen de /ES con cierto retraso pero usable.
+    """
+    try:
+        es = yf.download("ES=F", period="5d", interval="1d", progress=False)
+        if es.empty or len(es) < 2:
+            return None
+        cierres = es["Close"].squeeze()
+        vols    = es["Volume"].squeeze()
+        apert   = es["Open"].squeeze()
+        vol_hoy   = float(vols.iloc[-1])
+        vol_prom  = float(vols.iloc[:-1].mean())
+        cambio    = float(cierres.iloc[-1] - apert.iloc[-1])  # vela del día
+        if vol_prom <= 0:
+            return None
+        ratio_vol = vol_hoy / vol_prom
+        # Solo cuenta si el volumen es notable (>1.1x promedio)
+        if ratio_vol < 1.1:
+            return {"voto": 0, "fuerza": 0.2,
+                    "texto": f"volumen normal ({ratio_vol:.1f}x)"}
+        # Volumen alto: la dirección de la vela manda
+        fuerza = min(1.0, (ratio_vol - 1.0))
+        if cambio > 0:
+            return {"voto": +1, "fuerza": fuerza,
+                    "texto": f"volumen alto {ratio_vol:.1f}x + vela alcista"}
+        elif cambio < 0:
+            return {"voto": -1, "fuerza": fuerza,
+                    "texto": f"volumen alto {ratio_vol:.1f}x + vela bajista"}
+        else:
+            return {"voto": 0, "fuerza": 0.2, "texto": "volumen alto sin dirección"}
+    except Exception as e:
+        print(f"  [TIBURONES] Error volumen: {e}")
+        return None
+
+
+def calcular_indice_tiburones():
+    """
+    Combina las huellas observables del posicionamiento de Leveraged
+    Funds en un sesgo direccional con confluencia.
+
+    Huellas (cada una vota -1/0/+1 con una fuerza 0-1):
+      1. CME OI         (sube/baja)            — peso 1.2 (directa)
+      2. Volumen fut.   (direccional)          — peso 0.8 (indirecta)
+      3. Sweeps         (calls vs puts netos)  — peso 1.5 (la más directa)
+      4. Dark Pool      (acum/distrib)         — peso 1.0 (inferida)
+      5. Basis          (futuro vs spot)       — peso 0.9 (indirecta)
+      6. Roll/term      — PENDIENTE de datos confiables (no se usa)
+
+    Suma ponderada → dirección. Dispersión de votos → distingue
+    neutral por consenso (todos tibios) de neutral por conflicto
+    (huellas peleando).
+    """
+    global indice_tiburones_cache
+
+    huellas = {}   # nombre → {voto, fuerza, peso, texto}
+
+    # ── Huella 1: CME OI (sube = abriendo, baja = cerrando) ──────
+    if cme_oi_cache.get("disponible") and cme_oi_cache.get("cambio_diario", 0) != 0:
+        cambio_oi = cme_oi_cache["cambio_diario"]
+        # Normalizar: un cambio diario típico del E-mini es ~10-50k contratos
+        fuerza = min(1.0, abs(cambio_oi) / 50_000)
+        voto = 1 if cambio_oi > 0 else -1
+        signo = "subiendo" if cambio_oi > 0 else "bajando"
+        huellas["CME OI"] = {"voto": voto, "fuerza": fuerza, "peso": 1.2,
+                             "texto": f"OI {signo} ({cambio_oi:+,})"}
+
+    # ── Huella 3: Sweeps (calls vs puts netos del día) ───────────
+    # Usa el balance del sweep_cache (ya arreglado el bug del +0)
+    prima_c = sweep_cache.get("prima_calls_hoy", 0)
+    prima_p = sweep_cache.get("prima_puts_hoy", 0)
+    if (sweep_cache.get("ultimo_sweep") and prima_c + prima_p > 0):
+        balance = prima_c - prima_p
+        total   = prima_c + prima_p
+        fuerza  = min(1.0, abs(balance) / 300_000_000)  # $300M neto = fuerza máx
+        if balance > 0:
+            voto, txt = +1, f"calls dominan +${balance/1e6:.0f}M"
+        elif balance < 0:
+            voto, txt = -1, f"puts dominan -${abs(balance)/1e6:.0f}M"
+        else:
+            voto, txt = 0, "equilibrado"
+        huellas["Sweeps"] = {"voto": voto, "fuerza": fuerza, "peso": 1.5,
+                             "texto": txt}
+
+    # ── Huella 4: Dark Pool (acumulación/distribución) ───────────
+    if dark_pool_cache.get("disponible"):
+        tend = dark_pool_cache.get("tendencia", "NEUTRAL")
+        if tend in ["ACUMULANDO", "MOMENTUM_ALCISTA"]:
+            huellas["Dark Pool"] = {"voto": +1, "fuerza": 0.7, "peso": 1.0,
+                                    "texto": "acumulando"}
+        elif tend in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]:
+            huellas["Dark Pool"] = {"voto": -1, "fuerza": 0.7, "peso": 1.0,
+                                    "texto": "distribuyendo"}
+        else:
+            huellas["Dark Pool"] = {"voto": 0, "fuerza": 0.2, "peso": 1.0,
+                                    "texto": "neutral"}
+
+    # ── Huella 2: Volumen direccional de futuros ─────────────────
+    hv = _huella_volumen_futuros()
+    if hv:
+        huellas["Volumen"] = {**hv, "peso": 0.8}
+
+    # ── Huella 5: Basis (futuro vs spot) ─────────────────────────
+    hb = _huella_basis()
+    if hb:
+        huellas["Basis"] = {**hb, "peso": 0.9}
+
+    # ── Huella 6: Roll/term structure — PENDIENTE ────────────────
+    # No hay fuente confiable de contratos por vencimiento en yfinance.
+    # Se marca pendiente para no meter ruido (decisión del usuario).
+
+    # ── Combinar votos ───────────────────────────────────────────
+    if not huellas:
+        indice_tiburones_cache.update({
+            "disponible": False, "sesgo": None, "ultima_actualizacion": hora_ny()})
+        return
+
+    # Suma ponderada: cada huella aporta voto × fuerza × peso
+    suma_pond = sum(h["voto"] * h["fuerza"] * h["peso"] for h in huellas.values())
+    peso_total = sum(h["peso"] for h in huellas.values())
+    score = suma_pond / peso_total if peso_total > 0 else 0.0
+
+    # Confluencia: cuántas huellas votan en la dirección dominante
+    direccion = 1 if score > 0 else (-1 if score < 0 else 0)
+    votos_a_favor = sum(1 for h in huellas.values() if h["voto"] == direccion and direccion != 0)
+    votos_total   = sum(1 for h in huellas.values() if h["voto"] != 0)
+
+    # Dispersión: desviación de los votos (distingue consenso de conflicto)
+    votos_lista = [h["voto"] for h in huellas.values()]
+    n_pos = sum(1 for v in votos_lista if v > 0)
+    n_neg = sum(1 for v in votos_lista if v < 0)
+
+    # ── Determinar sesgo y tipo de neutral ───────────────────────
+    UMBRAL_SESGO = 0.15  # |score| mínimo para declarar dirección
+    tipo_neutral = None
+    if abs(score) >= UMBRAL_SESGO:
+        sesgo = "ALCISTA" if score > 0 else "BAJISTA"
+    else:
+        sesgo = "NEUTRAL"
+        # Conflicto: hay votos fuertes en AMBAS direcciones
+        if n_pos >= 1 and n_neg >= 1 and (n_pos + n_neg) >= 2:
+            tipo_neutral = "conflicto"
+        else:
+            tipo_neutral = "consenso"
+
+    # ── Confianza según confluencia y fuerza ─────────────────────
+    if abs(score) >= 0.40 and votos_a_favor >= 3:
+        confianza = "ALTA"
+    elif abs(score) >= 0.20 and votos_a_favor >= 2:
+        confianza = "MEDIA"
+    else:
+        confianza = "BAJA"
+
+    indice_tiburones_cache.update({
+        "disponible":     True,
+        "sesgo":          sesgo,
+        "tipo_neutral":   tipo_neutral,
+        "score":          round(score, 3),
+        "confluencia":    votos_a_favor,
+        "huellas_activas":votos_total,
+        "confianza":      confianza,
+        "huellas":        huellas,
+        "ultima_actualizacion": hora_ny(),
+    })
+
+    print(f"  [TIBURONES] 🦈 Sesgo:{sesgo}"
+          f"{'/'+tipo_neutral if tipo_neutral else ''} | "
+          f"Score:{score:+.2f} | Confluencia:{votos_a_favor}/{votos_total} | "
+          f"Confianza:{confianza} | Huellas:{len(huellas)}")
+
+
+def texto_indice_tiburones():
+    """Arma el mensaje del Índice de Tiburones para Telegram."""
+    ic = indice_tiburones_cache
+    if not ic.get("disponible"):
+        return ""
+
+    sesgo = ic["sesgo"]
+    if sesgo == "ALCISTA":
+        emoji, cab = "🟢", "ALCISTA"
+    elif sesgo == "BAJISTA":
+        emoji, cab = "🔴", "BAJISTA"
+    else:
+        emoji = "⚪"
+        cab = ("NEUTRAL (señales en conflicto)" if ic["tipo_neutral"] == "conflicto"
+               else "NEUTRAL (consenso débil)")
+
+    lineas = [f"\n🦈 *ÍNDICE DE TIBURONES*",
+              f"{emoji} Sesgo: *{cab}*"]
+
+    # Confluencia (solo si hay dirección)
+    if sesgo != "NEUTRAL":
+        lineas.append(f"📊 Confluencia: {ic['confluencia']}/{ic['huellas_activas']} huellas • "
+                      f"Confianza: {ic['confianza']}")
+    elif ic["tipo_neutral"] == "conflicto":
+        lineas.append(f"⚠️ Huellas peleando — esperar resolución")
+
+    # Detalle de cada huella
+    nombres_emoji = {"Sweeps": "🌊", "CME OI": "📈", "Dark Pool": "🏦",
+                     "Basis": "⚖️", "Volumen": "📊"}
+    for nombre, h in ic["huellas"].items():
+        v = h["voto"]
+        flecha = "🟢↑" if v > 0 else ("🔴↓" if v < 0 else "⚪–")
+        em = nombres_emoji.get(nombre, "•")
+        lineas.append(f"{em} {nombre}: {flecha} {h['texto']}")
+
+    # Roll pendiente (transparencia)
+    lineas.append("🔄 Roll/term: _pendiente de datos_")
+
+    return "\n".join(lineas)
+
+
 def validar_cot_estimado_vs_real():
     """
-    Se llama cada viernes cuando llega el nuevo COT real.
-    Compara el estimado del miércoles vs el COT real publicado.
-    Este es el momento donde vemos qué tan bueno fue nuestro estimado.
+    JUBILADA (sesión 22-jun): reemplazada por el Índice de Tiburones.
+    El COT estimado viejo producía un número de contratos imposible de
+    replicar fielmente (estimó +915,218 vs real +57,307, error +857,911
+    y dirección equivocada). El COT REAL de la CFTC sigue descargándose
+    y mostrándose aparte — eso NO se tocó. Esta función se conserva como
+    no-op para no romper las llamadas que quedan en el loop.
     """
-    global cot_estimado_cache
+    return
 
-    if not cot_estimado_cache["disponible"]:
-        return
-    if not cot_cache["disponible"] or not cot_cache["neto_largo"]:
-        return
-
-    # ── GUARDA ANTI-REVALIDACIÓN ─────────────────────────────
-    # No validar el mismo reporte CFTC dos veces (evita loop de deploys)
-    fecha_real_actual = cot_cache.get("fecha_reporte")
-    if (fecha_real_actual and
-            cot_estimado_cache.get("ultima_fecha_validada") == fecha_real_actual):
-        print(f"  [COT_EST] ⏭ Ya validado el COT {fecha_real_actual} — sin revalidar")
-        return
-    # No validar un estimado de 0 días (no hubo acumulación real)
-    if cot_senales_semana.get("dias_acumulados", 0) == 0:
-        print("  [COT_EST] ⏭ Estimado de 0 días — solo inicia acumulación, sin validar")
-        cot_estimado_cache["ultima_fecha_validada"] = fecha_real_actual
-        iniciar_acumulacion_cot()
-        return
-
-    # El cambio real = COT nuevo - COT base que usamos
-    cot_nuevo    = cot_cache["neto_largo"]
-    cot_base     = cot_estimado_cache["cot_base"]
-    cambio_real  = cot_nuevo - cot_base
-    cambio_est   = cot_estimado_cache["cambio_estimado"]
-    neto_est     = cot_estimado_cache["neto_estimado"]
-    sesgo_est    = cot_estimado_cache["sesgo"]
-    confianza    = cot_estimado_cache["confianza"]
-    dias_acc     = cot_senales_semana["dias_acumulados"]
-
-    if cot_base == 0:
-        return
-
-    # Sesgo real del COT nuevo
-    sesgo_real = cot_cache.get("sesgo", "N/D")
-    fecha_real = cot_cache.get("fecha_reporte", "N/D")
-
-    # Error relativo al COT base
-    error_pct = abs((cambio_est - cambio_real) / abs(cot_base) * 100) if cot_base != 0 else 100
-    precision = "✅ BUENA" if error_pct <= 3 else ("⚠️ ACEPTABLE" if error_pct <= 7 else "❌ MEJORAR")
-
-    # ¿El sesgo estimado coincidió con el real?
-    sesgo_correcto = (
-        ("ALCISTA" in sesgo_est and "ALCISTA" in sesgo_real) or
-        ("BAJISTA" in sesgo_est and "BAJISTA" in sesgo_real) or
-        (sesgo_est == "NEUTRAL" and sesgo_real == "NEUTRAL")
-    )
-    sesgo_icono = "✅" if sesgo_correcto else "❌"
-
-    historial = cot_estimado_cache["historial_error"]
-    historial.append(error_pct)
-    if len(historial) > 4:
-        historial.pop(0)
-
-    # Nueva confianza basada en historial actualizado
-    if len(historial) >= 2:
-        error_prom = sum(abs(e) for e in historial) / len(historial)
-        nueva_confianza = max(0.0, min(1.0, 1.0 - (error_prom / 10.0)))
-    elif len(historial) == 1:
-        nueva_confianza = 0.3
-    else:
-        nueva_confianza = 0.1
-    cot_estimado_cache["confianza"] = nueva_confianza
-
-    print(f"  [COT_EST] 🎯 Validación: Base={cot_base:+,} | "
-          f"Cambio estimado={cambio_est:+,} | Cambio real={cambio_real:+,} | "
-          f"Error={error_pct:.1f}% {precision} | Sesgo:{sesgo_icono}")
-
-    try:
-        semanas_validadas = len(historial)
-        semanas_texto = f"{semanas_validadas}/4 semanas validadas"
-
-        if nueva_confianza >= 0.9:
-            estado_modelo = "🏆 MODELO CONFIABLE — Integrar al score ±2"
-        elif semanas_validadas >= 4:
-            estado_modelo = f"⚠️ {semanas_texto} — Continuar calibrando"
-        else:
-            estado_modelo = f"🔬 {semanas_texto} — Calibrando..."
-
-        msg = (
-            f"🎯 *COT REAL vs ESTIMADO — Semana {cot_estimado_cache['semana_estimando']}*\n"
-            f"────────────────────────────\n"
-            f"*COT REAL (CFTC — fecha corte: {fecha_real}):*\n"
-            f"📊 Neto real: `{cot_nuevo:+,}` contratos\n"
-            f"📈 Cambio real: `{cambio_real:+,}`\n"
-            f"🎯 Sesgo real: `{sesgo_real.replace('_',' ')}`\n"
-            f"────────────────────────────\n"
-            f"*NUESTRO ESTIMADO (del miércoles):*\n"
-            f"📊 Neto estimado: `{neto_est:+,}` contratos\n"
-            f"📈 Cambio estimado: `{cambio_est:+,}` ({dias_acc} días)\n"
-            f"🎯 Sesgo estimado: `{sesgo_est.replace('_',' ')}` {sesgo_icono}\n"
-            f"────────────────────────────\n"
-            f"📐 Error: `{error_pct:.1f}%` {precision}\n"
-            f"🔬 Confianza nueva: `{nueva_confianza:.0%}`\n"
-            f"────────────────────────────\n"
-            f"{estado_modelo}"
-        )
-        if len(msg) > 4096: msg = msg[:4090] + "..."
-        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
-    except Exception as e:
-        print(f"  [COT_EST] Error enviando validación: {e}")
-
-    # Marcar este COT como validado — no se revalida en próximos deploys
-    cot_estimado_cache["ultima_fecha_validada"] = cot_cache.get("fecha_reporte")
-    # Iniciar acumulación para la próxima semana con el nuevo COT como base
-    iniciar_acumulacion_cot()
 
 def evaluar_cot():
     if not cot_cache["disponible"]:
@@ -1490,6 +1667,8 @@ gex_0dte_cache = {
     "ultima_actualizacion": None,
     "ultimo_giro_signo":    0,      # signo del último giro notificado (+1/-1/0)
     "ultimo_giro_hora":     None,   # hora del último giro notificado (cooldown)
+    "signo_pendiente":      0,      # signo candidato a giro (esperando persistencia)
+    "ciclos_persistencia":  0,      # ciclos consecutivos que el signo nuevo se mantiene
     "dia":                  None,
 }
 
@@ -1596,27 +1775,42 @@ def obtener_gex_0dte():
         print(f"  [GEX_0DTE] ✅ Neto:{neto:+,.0f} | Flip0DTE:{flip*10:.0f} | "
               f"Dealers: {regimen}{conf_txt}")
 
-        # ── Alerta de giro de régimen (múltiples por día) ────
-        # El RÉGIMEN lo define el NETO (suma de gamma), que es robusto.
-        # El flip es solo un nivel de referencia: si sale ruidoso (lejano),
-        # NO bloqueamos el giro — solo lo omitimos del mensaje.
-        # Condiciones para alertar:
-        #  (1) el neto cambió de signo,
-        #  (2) el nuevo signo es distinto al último notificado,
-        #  (3) pasaron >=20 min desde la última alerta (anti-spam).
+        # ── Alerta de giro de régimen (CON PERSISTENCIA) ─────
+        # El RÉGIMEN lo define el NETO (suma de gamma). PERO un solo
+        # cruce de signo puede ser un PICO DE RUIDO (caso lunes 22-jun:
+        # giro falso a negativa 9:35, precio quedó en rango 4+ horas).
+        # SOLUCIÓN: exigir PERSISTENCIA — el neto debe mantener el signo
+        # nuevo por 2 ciclos consecutivos (3 lecturas) antes de declarar
+        # el giro. Un pico aislado de 1 ciclo ya no dispara la alerta.
+        CICLOS_REQUERIDOS = 2   # ciclos consecutivos manteniendo el signo nuevo
         COOLDOWN_GIRO_MIN = 20
-        if neto_ant != 0 and neto * neto_ant < 0:
-            signo_nuevo  = 1 if neto > 0 else -1
-            ultimo_signo = gex_0dte_cache.get("ultimo_giro_signo", 0)
-            ultima_hora  = gex_0dte_cache.get("ultimo_giro_hora")
-            mins_desde   = ((ahora - ultima_hora).total_seconds() / 60
-                            if ultima_hora else 9999)
-            if signo_nuevo != ultimo_signo and mins_desde >= COOLDOWN_GIRO_MIN:
-                gex_0dte_cache["ultimo_giro_signo"] = signo_nuevo
-                gex_0dte_cache["ultimo_giro_hora"]  = ahora
+        signo_actual = 1 if neto > 0 else (-1 if neto < 0 else 0)
+        ultimo_signo = gex_0dte_cache.get("ultimo_giro_signo", 0)
+
+        if signo_actual != 0 and signo_actual != ultimo_signo:
+            # El signo actual difiere del último régimen notificado:
+            # candidato a giro. ¿Se está mantieniendo?
+            if signo_actual == gex_0dte_cache.get("signo_pendiente", 0):
+                # Mismo candidato que el ciclo anterior → suma persistencia
+                gex_0dte_cache["ciclos_persistencia"] += 1
+            else:
+                # Candidato nuevo → reinicia el conteo
+                gex_0dte_cache["signo_pendiente"]     = signo_actual
+                gex_0dte_cache["ciclos_persistencia"] = 1
+
+            ciclos = gex_0dte_cache["ciclos_persistencia"]
+            ultima_hora = gex_0dte_cache.get("ultimo_giro_hora")
+            mins_desde  = ((ahora - ultima_hora).total_seconds() / 60
+                           if ultima_hora else 9999)
+
+            if ciclos >= CICLOS_REQUERIDOS and mins_desde >= COOLDOWN_GIRO_MIN:
+                # Persistencia confirmada → declarar el giro
+                gex_0dte_cache["ultimo_giro_signo"]   = signo_actual
+                gex_0dte_cache["ultimo_giro_hora"]    = ahora
+                gex_0dte_cache["signo_pendiente"]     = 0
+                gex_0dte_cache["ciclos_persistencia"] = 0
                 nuevo_reg = "🟢 GAMMA POSITIVA — dealers frenarán los movimientos" \
                             if neto > 0 else "🔴 GAMMA NEGATIVA — dealers amplificarán los movimientos"
-                # Mostrar el flip solo si es confiable; si no, omitirlo
                 if flip_confiable:
                     flip_linea = f"\nFlip 0DTE: `{gex_0dte_cache['flip_0dte']}`"
                 else:
@@ -1624,14 +1818,27 @@ def obtener_gex_0dte():
                 try:
                     bot.send_message(TELEGRAM_CHAT_ID,
                         f"⚡ *GIRO DE RÉGIMEN GEX 0DTE*\n"
-                        f"El flujo dealer de HOY cambió de signo.\n{nuevo_reg}{flip_linea}",
+                        f"El flujo dealer de HOY cambió de signo "
+                        f"_(confirmado {ciclos+1} lecturas)_.\n{nuevo_reg}{flip_linea}",
                         parse_mode="Markdown")
-                    print(f"  [GEX_0DTE] ⚡ Alerta giro enviada → {'POSITIVA' if neto>0 else 'NEGATIVA'}"
+                    print(f"  [GEX_0DTE] ⚡ Giro CONFIRMADO (persistencia {ciclos}) → "
+                          f"{'POSITIVA' if neto>0 else 'NEGATIVA'}"
                           f"{' (flip omitido)' if not flip_confiable else ''}")
                 except Exception as e:
                     print(f"  [GEX_0DTE] Error alerta: {e}")
-            elif signo_nuevo != ultimo_signo:
-                print(f"  [GEX_0DTE] ⏭ Giro real pero en cooldown ({mins_desde:.0f}/{COOLDOWN_GIRO_MIN} min) — no se notifica")
+            elif ciclos < CICLOS_REQUERIDOS:
+                print(f"  [GEX_0DTE] 🕐 Posible giro a {'POSITIVA' if signo_actual>0 else 'NEGATIVA'} "
+                      f"— esperando persistencia ({ciclos}/{CICLOS_REQUERIDOS} ciclos)")
+            elif mins_desde < COOLDOWN_GIRO_MIN:
+                print(f"  [GEX_0DTE] ⏭ Giro persistente pero en cooldown ({mins_desde:.0f}/{COOLDOWN_GIRO_MIN} min)")
+        else:
+            # El signo volvió al régimen actual → el candidato se cae
+            # (esto es lo que filtra los picos: si el pico dura 1 ciclo
+            #  y vuelve, el conteo se descarta y no hubo falsa alarma).
+            if gex_0dte_cache.get("signo_pendiente", 0) != 0:
+                print(f"  [GEX_0DTE] 🔁 Candidato a giro descartado (volvió al régimen actual — era ruido)")
+            gex_0dte_cache["signo_pendiente"]     = 0
+            gex_0dte_cache["ciclos_persistencia"] = 0
 
     except Exception as e:
         print(f"  [GEX_0DTE] Error: {e}")
@@ -3116,33 +3323,87 @@ def calcular_score_total(datos, minutos_apertura):
 
     cot_score_ajustado = cot_score_raw  # Default: peso completo
 
-    # ── Nivel 3: COT alcista + sweep bajista neto + precio cayendo → peso 0
-    if cot_score_raw > 0 and sweep_bajista_neto and dp_bajista:
-        cot_score_ajustado = 0
-        print(f"  [COT] 🚫 Peso eliminado — contradice Sweep BAJISTA + Dark Pool bajista")
+    # ═══════════════════════════════════════════════════════════
+    # ÍNDICE DE TIBURONES vs COT REAL — el flujo fresco destrona
+    # a la foto vieja. El COT real es posicionamiento de hasta 6
+    # días atrás; el Índice de Tiburones es flujo institucional
+    # del día. Cuando el índice tiene sesgo CLARO y lo contradice,
+    # el índice gana (esto resuelve los fallos del 16 y 22-jun:
+    # COT alcista viejo vs sweeps bajistas frescos masivos).
+    # ═══════════════════════════════════════════════════════════
+    idx = indice_tiburones_cache
+    idx_destrono = False
+    if idx.get("disponible") and idx.get("sesgo") in ("ALCISTA", "BAJISTA"):
+        idx_alcista  = idx["sesgo"] == "ALCISTA"
+        idx_bajista  = idx["sesgo"] == "BAJISTA"
+        idx_conf     = idx.get("confianza", "BAJA")
+        idx_confluencia = idx.get("confluencia", 0)
 
-    # ── Nivel 3: COT bajista + sweep alcista neto + precio subiendo → peso 0
-    elif cot_score_raw < 0 and sweep_alcista_neto and dp_alcista:
-        cot_score_ajustado = 0
-        print(f"  [COT] 🚫 Peso eliminado — contradice Sweep ALCISTA + Dark Pool alcista")
+        # COT alcista contradicho por índice bajista
+        if cot_score_raw > 0 and idx_bajista:
+            if idx_conf == "ALTA":
+                # Destronado: el COT se invierte parcialmente (el flujo
+                # fresco no solo anula, sino que pesa en su dirección)
+                cot_score_ajustado = -1
+                idx_destrono = True
+                print(f"  [COT] 🦈 DESTRONADO → Índice Tiburones BAJISTA (conf.{idx_conf}, "
+                      f"confluencia {idx_confluencia}) invierte el COT alcista a -1")
+            elif idx_conf == "MEDIA":
+                cot_score_ajustado = 0
+                idx_destrono = True
+                print(f"  [COT] 🦈 Anulado → Índice Tiburones BAJISTA (conf.{idx_conf}) "
+                      f"neutraliza el COT alcista")
 
-    # ── Nivel 1: COT contradice Dark Pool Y Macro → peso ±1
-    elif cot_score_raw > 0 and dp_bajista and macro_bajista:
-        cot_score_ajustado = 1
-        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro bajista")
+        # COT bajista contradicho por índice alcista
+        elif cot_score_raw < 0 and idx_alcista:
+            if idx_conf == "ALTA":
+                cot_score_ajustado = 1
+                idx_destrono = True
+                print(f"  [COT] 🦈 DESTRONADO → Índice Tiburones ALCISTA (conf.{idx_conf}, "
+                      f"confluencia {idx_confluencia}) invierte el COT bajista a +1")
+            elif idx_conf == "MEDIA":
+                cot_score_ajustado = 0
+                idx_destrono = True
+                print(f"  [COT] 🦈 Anulado → Índice Tiburones ALCISTA (conf.{idx_conf}) "
+                      f"neutraliza el COT bajista")
 
-    elif cot_score_raw < 0 and dp_alcista and macro_alcista:
-        cot_score_ajustado = -1
-        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro alcista")
+        # Confirmación: índice y COT coinciden → el COT mantiene su peso
+        elif (cot_score_raw > 0 and idx_alcista) or (cot_score_raw < 0 and idx_bajista):
+            if idx_conf in ("ALTA", "MEDIA"):
+                print(f"  [COT] ✅ Confirmado por Índice Tiburones ({idx['sesgo']}, "
+                      f"conf.{idx_conf}) — COT mantiene peso completo")
 
-    # ── Nivel 2: COT contradice Dark Pool O Macro (uno solo) → peso ±1
-    elif cot_score_raw > 0 and (dp_bajista or macro_bajista):
-        cot_score_ajustado = 1
-        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro bajista")
+    # ── Lógica de respaldo (dark pool / macro) — solo si el índice
+    #    NO ya destronó al COT. Mantiene el comportamiento anterior
+    #    como red de seguridad adicional.
+    if not idx_destrono:
+        # ── Nivel 3: COT alcista + sweep bajista neto + DP bajista → peso 0
+        if cot_score_raw > 0 and sweep_bajista_neto and dp_bajista:
+            cot_score_ajustado = 0
+            print(f"  [COT] 🚫 Peso eliminado — contradice Sweep BAJISTA + Dark Pool bajista")
 
-    elif cot_score_raw < 0 and (dp_alcista or macro_alcista):
-        cot_score_ajustado = -1
-        print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro alcista")
+        # ── Nivel 3: COT bajista + sweep alcista neto + DP alcista → peso 0
+        elif cot_score_raw < 0 and sweep_alcista_neto and dp_alcista:
+            cot_score_ajustado = 0
+            print(f"  [COT] 🚫 Peso eliminado — contradice Sweep ALCISTA + Dark Pool alcista")
+
+        # ── Nivel 1: COT contradice Dark Pool Y Macro → peso ±1
+        elif cot_score_raw > 0 and dp_bajista and macro_bajista:
+            cot_score_ajustado = 1
+            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro bajista")
+
+        elif cot_score_raw < 0 and dp_alcista and macro_alcista:
+            cot_score_ajustado = -1
+            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro alcista")
+
+        # ── Nivel 2: COT contradice Dark Pool O Macro (uno solo) → peso ±1
+        elif cot_score_raw > 0 and (dp_bajista or macro_bajista):
+            cot_score_ajustado = 1
+            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro bajista")
+
+        elif cot_score_raw < 0 and (dp_alcista or macro_alcista):
+            cot_score_ajustado = -1
+            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro alcista")
 
     componentes = {
         "delta_volumen":   d_vol["score"],
@@ -3605,12 +3866,9 @@ def enviar_pre_apertura():
         except Exception as e:
             print(f"  [CALENDARIO] Error en pre-apertura: {e}")
 
-        # ── COT Estimado texto ────────────────────────────────
+        # ── COT Estimado texto (JUBILADO — reemplazado por Índice Tiburones) ─
+        # El índice va en su propio bloque más abajo, no en la línea del COT.
         cot_est_texto = ""
-        if cot_estimado_cache.get("disponible"):
-            confianza = cot_estimado_cache.get("confianza", 0)
-            sesgo_est = cot_estimado_cache.get("sesgo", "N/D")
-            cot_est_texto = f" | EST({confianza:.0%}): {sesgo_est}"
 
         # ── Countdown dinámico ────────────────────────────────
         mins_para_open = max(0, 9 * 60 + 30 - hora_et)
@@ -3629,6 +3887,14 @@ def enviar_pre_apertura():
                 opex_texto = "\n📌 Post-OPEX — flujos liberados, más dirección probable"
         except: pass
 
+        # ── Índice de Tiburones (reemplaza al COT estimado viejo) ──
+        tiburones_texto = ""
+        try:
+            calcular_indice_tiburones()
+            tiburones_texto = texto_indice_tiburones()
+        except Exception as e:
+            print(f"  [TIBURONES] Error en pre-apertura: {e}")
+
         msg = (f"🌅 *PRE-APERTURA — US500 v3.9*\n{'─'*28}\n"
                f"⏰ Mercado abre {open_txt}\n"
                f"{emoji_dir} Futuros S&P: `{futuro_precio:.0f}` ({futuro_cambio:+.2f}%)\n"
@@ -3638,7 +3904,8 @@ def enviar_pre_apertura():
                f"🌍 Macro: `{macro_imp}`"
                f"{gex_texto}"
                f"{opex_texto}"
-               f"{calendario_texto}")
+               f"{calendario_texto}"
+               f"{tiburones_texto}")
         try:
             bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
         except Exception:
@@ -4603,6 +4870,12 @@ while True:
                     msg_regimen += texto_oi_walls()
                 except Exception:
                     pass
+                # Añadir Índice de Tiburones (sesgo institucional por huellas)
+                try:
+                    calcular_indice_tiburones()
+                    msg_regimen += texto_indice_tiburones()
+                except Exception as e:
+                    print(f"  [TIBURONES] Error en régimen: {e}")
                 try:
                     bot.send_message(TELEGRAM_CHAT_ID, msg_regimen, parse_mode="Markdown")
                 except Exception:
@@ -4664,11 +4937,13 @@ while True:
             (ahora_ny - cme_oi_cache["ultima_actualizacion"]).total_seconds() / 60 >= 60):
             obtener_cme_oi()
 
-        # ── COT Estimado — actualizar cada 30 minutos ─────────
-        if cot_cache["disponible"]:
-            if (not cot_estimado_cache["ultima_actualizacion"] or
-                (ahora_ny - cot_estimado_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
-                actualizar_cot_estimado()
+        # ── Índice de Tiburones — recalcular cada 30 minutos ──
+        if (not indice_tiburones_cache["ultima_actualizacion"] or
+            (ahora_ny - indice_tiburones_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
+            try:
+                calcular_indice_tiburones()
+            except Exception as e:
+                print(f"  [TIBURONES] Error recalculando: {e}")
 
         # ── Alertas proximidad GEX ───────────────────────────
         if gex_niveles["disponible"]:
@@ -4702,6 +4977,8 @@ while True:
                         "contratos_calls": sweep.get("contratos_calls", 0),
                         "contratos_puts":  sweep.get("contratos_puts", 0),
                         "prima_total":     sweep["balance_neto"],
+                        "prima_calls_hoy": sweep.get("prima_calls", 0),
+                        "prima_puts_hoy":  sweep.get("prima_puts", 0),
                         "strikes":         max(sweep.get("strikes_calls", 0), sweep.get("strikes_puts", 0)),
                         "alerta_enviada":  True,
                     })
