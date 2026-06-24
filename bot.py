@@ -1008,45 +1008,94 @@ def calcular_indice_tiburones():
         huellas["CME OI"] = {"voto": voto, "fuerza": fuerza, "peso": 1.2,
                              "texto": f"OI {signo} ({cambio_oi:+,})"}
 
-    # ── Huella 3: Sweeps (calls vs puts netos del día) ───────────
-    # Usa el balance del sweep_cache (ya arreglado el bug del +0)
+    # ── Huella 3: Sweeps (magnitud + aceleración) ────────────────
+    # Implementa los dos patrones que el usuario observó operando:
+    #  (A) MAGNITUD: si el balance neto se acerca a ~$500M, el precio
+    #      sigue esa dirección (pared de dinero sin contraparte).
+    #      Bajo ~$80M puede ser ruido absorbible.
+    #  (B) ACELERACIÓN: si el balance viene creciendo y luego DESACELERA
+    #      (ej. +220M → +190M), hay agotamiento aunque el signo siga
+    #      igual — el precio deja de seguir el movimiento. La clave no
+    #      es el signo sino la DERIVADA del balance.
     prima_c = sweep_cache.get("prima_calls_hoy", 0)
     prima_p = sweep_cache.get("prima_puts_hoy", 0)
     if (sweep_cache.get("ultimo_sweep") and prima_c + prima_p > 0):
         balance = prima_c - prima_p
-        total   = prima_c + prima_p
-        fuerza  = min(1.0, abs(balance) / 300_000_000)  # $300M neto = fuerza máx
+        abs_bal = abs(balance)
+
+        # (A) Fuerza por MAGNITUD — escalones según lo observado
+        UMBRAL_DOMINANTE = 500_000_000   # ~$500M = convicción dominante
+        UMBRAL_RUIDO     = 80_000_000    # bajo esto = ruido absorbible
+        if abs_bal >= UMBRAL_DOMINANTE:
+            fuerza_mag = 1.0
+            nivel_mag  = "DOMINANTE"
+        elif abs_bal <= UMBRAL_RUIDO:
+            fuerza_mag = 0.2
+            nivel_mag  = "ruido"
+        else:
+            # Interpolar entre ruido y dominante
+            fuerza_mag = 0.3 + 0.7 * (abs_bal - UMBRAL_RUIDO) / (UMBRAL_DOMINANTE - UMBRAL_RUIDO)
+            nivel_mag  = "moderado"
+
+        # (B) ACELERACIÓN — comparar el balance actual vs lecturas previas
+        hist = sweep_cache.get("historial_balance", [])
+        acel_txt = ""
+        factor_acel = 1.0
+        if len(hist) >= 3:
+            # Tendencia de la magnitud en la misma dirección del balance
+            # Tomamos las últimas 3 lecturas y vemos si |balance| crece o cae
+            ult3 = hist[-3:]
+            # ¿Vienen todas del mismo signo que el balance actual?
+            mismo_signo = all((b > 0) == (balance > 0) for b in ult3 if b != 0)
+            if mismo_signo and len(ult3) == 3:
+                mag_prev = abs(ult3[-2])
+                mag_now  = abs(ult3[-1])
+                if mag_now > mag_prev * 1.05:
+                    # Acelerando: el flujo gana fuerza → confirma dirección
+                    factor_acel = 1.15
+                    acel_txt = " ▲acelerando"
+                elif mag_now < mag_prev * 0.95:
+                    # Desacelerando: AGOTAMIENTO → el precio puede no seguir
+                    factor_acel = 0.55
+                    acel_txt = " ▼desacelera (agotamiento)"
+                else:
+                    acel_txt = " →estable"
+
+        fuerza = min(1.0, fuerza_mag * factor_acel)
+
         if balance > 0:
-            voto, txt = +1, f"calls dominan +${balance/1e6:.0f}M"
+            voto = +1
+            txt  = f"calls +${balance/1e6:.0f}M [{nivel_mag}]{acel_txt}"
         elif balance < 0:
-            voto, txt = -1, f"puts dominan -${abs(balance)/1e6:.0f}M"
+            voto = -1
+            txt  = f"puts -${abs_bal/1e6:.0f}M [{nivel_mag}]{acel_txt}"
         else:
             voto, txt = 0, "equilibrado"
-        huellas["Sweeps"] = {"voto": voto, "fuerza": fuerza, "peso": 1.5,
+
+        # Peso mayor si la magnitud es dominante (el usuario confía más
+        # en los sweeps grandes que en cualquier otra señal)
+        peso_sweep = 2.0 if nivel_mag == "DOMINANTE" else 1.5
+        huellas["Sweeps"] = {"voto": voto, "fuerza": fuerza, "peso": peso_sweep,
                              "texto": txt}
 
-    # ── Huella 4: Dark Pool (acumulación/distribución) ───────────
-    if dark_pool_cache.get("disponible"):
-        tend = dark_pool_cache.get("tendencia", "NEUTRAL")
-        if tend in ["ACUMULANDO", "MOMENTUM_ALCISTA"]:
-            huellas["Dark Pool"] = {"voto": +1, "fuerza": 0.7, "peso": 1.0,
-                                    "texto": "acumulando"}
-        elif tend in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]:
-            huellas["Dark Pool"] = {"voto": -1, "fuerza": 0.7, "peso": 1.0,
-                                    "texto": "distribuyendo"}
-        else:
-            huellas["Dark Pool"] = {"voto": 0, "fuerza": 0.2, "peso": 1.0,
-                                    "texto": "neutral"}
+    # ── Huella Dark Pool: ELIMINADA (martes 23-jun) ──────────────
+    # El proxy de yfinance daba 20% clavado todos los días (bug de
+    # clamp + lógica de índices mal alineada). El dark pool REAL
+    # requiere servicio pago — anotado como mejora futura. Mientras
+    # tanto los sweeps (Tradier, datos reales) son la huella
+    # institucional confiable.
+
+    # ── Huella Basis: ELIMINADA (martes 23-jun) ──────────────────
+    # Cálculo roto por desfase horario: comparaba /ES de hoy (cotiza
+    # 24h) contra ^GSPC de ayer (solo horario de mercado). Daba
+    # swings imposibles (-31.8pts un día, +81.8pts el otro). El basis
+    # real del S&P es de pocos puntos; su aporte direccional era
+    # marginal incluso bien calculado. Se quita por ruido.
 
     # ── Huella 2: Volumen direccional de futuros ─────────────────
     hv = _huella_volumen_futuros()
     if hv:
         huellas["Volumen"] = {**hv, "peso": 0.8}
-
-    # ── Huella 5: Basis (futuro vs spot) ─────────────────────────
-    hb = _huella_basis()
-    if hb:
-        huellas["Basis"] = {**hb, "peso": 0.9}
 
     # ── Huella 6: Roll/term structure — PENDIENTE ────────────────
     # No hay fuente confiable de contratos por vencimiento en yfinance.
@@ -1139,15 +1188,14 @@ def texto_indice_tiburones():
         lineas.append(f"⚠️ Huellas peleando — esperar resolución")
 
     # Detalle de cada huella
-    nombres_emoji = {"Sweeps": "🌊", "CME OI": "📈", "Dark Pool": "🏦",
-                     "Basis": "⚖️", "Volumen": "📊"}
+    nombres_emoji = {"Sweeps": "🌊", "CME OI": "📈", "Volumen": "📊"}
     for nombre, h in ic["huellas"].items():
         v = h["voto"]
         flecha = "🟢↑" if v > 0 else ("🔴↓" if v < 0 else "⚪–")
         em = nombres_emoji.get(nombre, "•")
         lineas.append(f"{em} {nombre}: {flecha} {h['texto']}")
 
-    # Roll pendiente (transparencia)
+    # Huellas retiradas y pendientes (transparencia)
     lineas.append("🔄 Roll/term: _pendiente de datos_")
 
     return "\n".join(lineas)
@@ -1898,8 +1946,17 @@ sweep_cache = {
     "contratos":      0,
     "strikes":        0,
     "prima_total":    0.0,
+    "prima_calls_hoy": 0.0,
+    "prima_puts_hoy":  0.0,
     "alerta_enviada": False,
     "dia":            None,
+    "balance_ultima_alerta": 0.0,  # balance neto cuando se envió la última alerta
+    # Historial de balances netos (para medir aceleración/desaceleración).
+    # Cada entrada es el balance neto (calls - puts) de un sweep sucesivo.
+    # El usuario observó: si el balance se desacelera entre sweeps
+    # consecutivos (ej. +220M → +190M), el precio ya no sigue el
+    # movimiento aunque el signo siga igual = AGOTAMIENTO.
+    "historial_balance": [],
 }
 
 # Estado para Put/Call ratio semanal via Tradier
@@ -4967,10 +5024,59 @@ while True:
                 if sweep_cache["dia"] != hoy:
                     sweep_cache["alerta_enviada"] = False
                     sweep_cache["dia"] = hoy
-                # Solo alertar si es nuevo sweep (distinto tipo o han pasado 30 min)
+                    sweep_cache["historial_balance"] = []  # limpiar historial diario
+
+                # Registrar el balance neto en el historial CADA 5 min (no solo
+                # al alertar) para medir aceleración/desaceleración con buena
+                # resolución. El usuario lee la DERIVADA del balance: si viene
+                # creciendo y luego desacelera, hay agotamiento aunque el signo
+                # siga igual. Guardamos el balance acumulado del día en cada
+                # lectura; solo registramos si cambió para no llenar de repetidos.
+                balance_actual = sweep.get("prima_calls", 0) - sweep.get("prima_puts", 0)
+                hist = sweep_cache.get("historial_balance", [])
+                if not hist or hist[-1] != balance_actual:
+                    hist.append(balance_actual)
+                    if len(hist) > 8:   # mantener las últimas 8 lecturas
+                        hist.pop(0)
+                    sweep_cache["historial_balance"] = hist
+
+                # ── Decisión de alerta (anti "perder el tren") ──────
+                # Reglas para enviar alerta:
+                #  1. Primera alerta del día, o cambió el tipo (signo)
+                #  2. Pasaron >=30 min (ciclo normal)
+                #  3. SALTAR el ciclo si el balance varió MUCHO desde la
+                #     última alerta — el usuario no quiere esperar 30 min
+                #     si el flujo cambió fuerte. Combina dos gatillos:
+                #     (a) salto de >=$150M desde la última alerta, O
+                #     (b) cruzó el umbral dominante de $500M (en cualquier
+                #         dirección) — el momento en que el flujo se vuelve
+                #         una pared de dinero que mueve el precio.
                 ultimo = sweep_cache["ultimo_sweep"]
                 mins_desde_sweep = (ahora_ny - ultimo).total_seconds() / 60 if ultimo else 9999
-                if not sweep_cache["alerta_enviada"] or mins_desde_sweep >= 30:
+                bal_ult_alerta = sweep_cache.get("balance_ultima_alerta", 0.0)
+                salto_balance  = abs(balance_actual - bal_ult_alerta)
+
+                SALTO_FUERTE   = 150_000_000   # $150M de cambio = novedad
+                UMBRAL_DOM     = 500_000_000   # cruce de $500M = dominante
+
+                # ¿El balance cruzó el umbral dominante desde la última alerta?
+                cruzo_dominante = (abs(balance_actual) >= UMBRAL_DOM and
+                                   abs(bal_ult_alerta) < UMBRAL_DOM)
+
+                # ¿Cambió el tipo (signo) respecto al último alertado?
+                tipo_nuevo = (sweep_cache.get("tipo") is not None and
+                              sweep["tipo"] != sweep_cache.get("tipo"))
+
+                ciclo_normal   = (not sweep_cache["alerta_enviada"] or
+                                  mins_desde_sweep >= 30)
+                salto_relevante = (salto_balance >= SALTO_FUERTE or cruzo_dominante)
+
+                if ciclo_normal or tipo_nuevo or salto_relevante:
+                    # Marcar el motivo para el log (transparencia)
+                    if salto_relevante and not ciclo_normal and not tipo_nuevo:
+                        motivo = (f"salto ${salto_balance/1e6:.0f}M" if salto_balance >= SALTO_FUERTE
+                                  else f"cruzó ${UMBRAL_DOM/1e6:.0f}M dominante")
+                        print(f"  [SWEEP] ⚡ Alerta ADELANTADA (saltó ciclo 30min): {motivo}")
                     sweep_cache.update({
                         "ultimo_sweep":    ahora_ny,
                         "tipo":            sweep["tipo"],
@@ -4981,6 +5087,7 @@ while True:
                         "prima_puts_hoy":  sweep.get("prima_puts", 0),
                         "strikes":         max(sweep.get("strikes_calls", 0), sweep.get("strikes_puts", 0)),
                         "alerta_enviada":  True,
+                        "balance_ultima_alerta": balance_actual,
                     })
                     direccion = sweep["tipo"]
                     emoji = "🟢" if direccion == "ALCISTA" else ("🔴" if direccion == "BAJISTA" else "⚪")
