@@ -3431,36 +3431,28 @@ def calcular_score_total(datos, minutos_apertura):
                       f"conf.{idx_conf}) — COT mantiene peso completo")
 
     # ── Lógica de respaldo (dark pool / macro) — solo si el índice
-    #    NO ya destronó al COT. Mantiene el comportamiento anterior
-    #    como red de seguridad adicional.
+    #    NO ya destronó al COT. Usa SWEEPS + MACRO (el dark pool fue
+    #    neutralizado por estar roto). Red de seguridad adicional por si
+    #    el índice no tiene datos suficientes.
     if not idx_destrono:
-        # ── Nivel 3: COT alcista + sweep bajista neto + DP bajista → peso 0
-        if cot_score_raw > 0 and sweep_bajista_neto and dp_bajista:
+        # ── COT alcista + sweep bajista neto fuerte → peso 0
+        if cot_score_raw > 0 and sweep_bajista_neto:
             cot_score_ajustado = 0
-            print(f"  [COT] 🚫 Peso eliminado — contradice Sweep BAJISTA + Dark Pool bajista")
+            print(f"  [COT] 🚫 Peso eliminado — contradice Sweep BAJISTA neto")
 
-        # ── Nivel 3: COT bajista + sweep alcista neto + DP alcista → peso 0
-        elif cot_score_raw < 0 and sweep_alcista_neto and dp_alcista:
+        # ── COT bajista + sweep alcista neto fuerte → peso 0
+        elif cot_score_raw < 0 and sweep_alcista_neto:
             cot_score_ajustado = 0
-            print(f"  [COT] 🚫 Peso eliminado — contradice Sweep ALCISTA + Dark Pool alcista")
+            print(f"  [COT] 🚫 Peso eliminado — contradice Sweep ALCISTA neto")
 
-        # ── Nivel 1: COT contradice Dark Pool Y Macro → peso ±1
-        elif cot_score_raw > 0 and dp_bajista and macro_bajista:
+        # ── COT contradice Macro → peso reducido ±1
+        elif cot_score_raw > 0 and macro_bajista:
             cot_score_ajustado = 1
-            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro bajista")
+            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Macro bajista")
 
-        elif cot_score_raw < 0 and dp_alcista and macro_alcista:
+        elif cot_score_raw < 0 and macro_alcista:
             cot_score_ajustado = -1
-            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool({dp_tendencia}) + Macro alcista")
-
-        # ── Nivel 2: COT contradice Dark Pool O Macro (uno solo) → peso ±1
-        elif cot_score_raw > 0 and (dp_bajista or macro_bajista):
-            cot_score_ajustado = 1
-            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro bajista")
-
-        elif cot_score_raw < 0 and (dp_alcista or macro_alcista):
-            cot_score_ajustado = -1
-            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Dark Pool O Macro alcista")
+            print(f"  [COT] ⚠️ Peso reducido ±1 — contradice Macro alcista")
 
     componentes = {
         "delta_volumen":   d_vol["score"],
@@ -3471,7 +3463,7 @@ def calcular_score_total(datos, minutos_apertura):
         "move_index":      move["score"],
         "dxy":             dxy["score"],
         "gex":             gex["score"],
-        "dark_pool":       dark_pool["score"],
+        "dark_pool":       0,  # NEUTRALIZADO 24-jun: el proxy yfinance da 20% clavado (bug clamp), daba MOMENTUM ALCISTA falso y contaminaba el score con sesgo alcista. Se pone en 0 hasta integrar dark pool REAL (servicio pago). La función obtener_dark_pool sigue viva para no romper otras referencias, pero su voto ya no suma al score.
         "patron_apertura": p_hora["score"] if p_hora["activo"] else 0,
         "posicion_rango":  pos_rango["score"],
         "liquidez":        liquidez["score"],
@@ -4408,8 +4400,9 @@ def enviar_alerta_score(resultado, analisis_claude):
         gex_str    = f"\n⚡ GEX({fuente_gex}): Flip:`{gex['gamma_flip']}` | Call:`{gex['call_wall']}` | Put:`{gex['put_wall']}`"
 
     dp     = detalle["dark_pool"]
-    dp_str = f"\n🏦 DarkPool({dp.get('fuente','?')}): `{dp['ratio']:.1%}` — {dp['interpretacion']}" \
-             if dp.get("disponible") else ""
+    # Dark pool DESACTIVADO (24-jun): proxy roto, ya no se muestra ni cuenta
+    # en el score. Se reactivará con dark pool REAL (servicio pago).
+    dp_str = ""
 
     liq     = detalle["liquidez"]
     liq_str = f"\n🌊 Liquidez: `{liq['nivel']}`" + (" ⚠️" if liq["alerta"] else "")
@@ -4427,6 +4420,18 @@ def enviar_alerta_score(resultado, analisis_claude):
     macro_emoji   = {"ALCISTA_FUERTE":"🟢🟢","ALCISTA_MODERADO":"🟢","NEUTRAL":"⚪",
                      "BAJISTA_MODERADO":"🔴","BAJISTA_FUERTE":"🔴🔴"}.get(macro_impacto, "⚪")
 
+    # Recalcular el Índice de Tiburones para mostrarlo CON los sweeps del
+    # día ya cargados (resuelve el timing: en la apertura el índice salía
+    # sin sweeps; en las señales del día ya los tiene).
+    tiburones_str = ""
+    try:
+        calcular_indice_tiburones()
+        tib = texto_indice_tiburones()
+        if tib:
+            tiburones_str = "\n" + tib
+    except Exception:
+        pass
+
     msg = (f"{emoji_dir} *SEÑAL {dir_texto} — US500*\n{'─'*28}\n"
            f"🕐 Hora: {ahora}\n💵 Precio: `{detalle['precio']:.2f}`\n"
            f"📊 Score: `{barra_score(score)}`\n"
@@ -4434,7 +4439,8 @@ def enviar_alerta_score(resultado, analisis_claude):
            f"{vix_str}{move_str}{dxy_str}{gex_str}{dp_str}{liq_str}{inst2_str}\n"
            f"📍 Rango: `{detalle['posicion_rango']['posicion_pct']}%`\n"
            f"🌍 Macro: {macro_emoji} `{macro_impacto.replace('_',' ')}`{pen_lines}\n"
-           f"{'─'*28}\n*Señales activas:*\n{senales_str}")
+           f"{'─'*28}\n*Señales activas:*\n{senales_str}"
+           f"{tiburones_str}")
     if len(msg) > 4096: msg = msg[:4090] + "..."
     try: bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
     except:
@@ -5116,13 +5122,37 @@ while True:
                     except Exception:
                         pass
 
+                    # ── Control del balance (lo que el usuario quería ver) ──
+                    # Muestra si el balance neto viene SUBIENDO, se FRENÓ, o
+                    # cruzó el umbral DOMINANTE de $500M, comparando con las
+                    # lecturas previas del historial.
+                    control_txt = ""
+                    hist_bal = sweep_cache.get("historial_balance", [])
+                    bal_actual = sweep.get("prima_calls", 0) - sweep.get("prima_puts", 0)
+                    abs_actual = abs(bal_actual)
+                    if abs_actual >= 500_000_000:
+                        control_txt = f"\n🚨 *DOMINANTE* — balance cruzó $500M, el precio suele seguir esta dirección"
+                    elif len(hist_bal) >= 2:
+                        prev = hist_bal[-2] if hist_bal[-1] == bal_actual else hist_bal[-1]
+                        mismo_signo = (prev > 0) == (bal_actual > 0)
+                        if mismo_signo:
+                            if abs_actual > abs(prev) * 1.05:
+                                control_txt = f"\n📈 Balance *ACELERANDO* (${abs(prev)/1e6:.0f}M → ${abs_actual/1e6:.0f}M) — el flujo gana fuerza"
+                            elif abs_actual < abs(prev) * 0.95:
+                                control_txt = f"\n⚠️ Balance *DESACELERANDO* (${abs(prev)/1e6:.0f}M → ${abs_actual/1e6:.0f}M) — posible agotamiento, el precio puede frenar"
+                            else:
+                                control_txt = f"\n➡️ Balance *ESTABLE* (~${abs_actual/1e6:.0f}M)"
+                        else:
+                            control_txt = f"\n🔄 Balance *CAMBIÓ DE LADO* (ahora {direccion})"
+
                     try:
                         bot.send_message(TELEGRAM_CHAT_ID,
                             f"{emoji} *SWEEP INSTITUCIONAL DETECTADO*\n"
                             f"────────────────────────────\n"
                             f"{calls_txt}{puts_txt}"
                             f"────────────────────────────\n"
-                            f"📊 Balance neto: *{direccion}* `${sweep['balance_neto']:,.0f}`\n"
+                            f"📊 Balance neto: *{direccion}* `${sweep['balance_neto']:,.0f}`"
+                            f"{control_txt}\n"
                             f"📅 Expiración: `{sweep['expiracion']}`\n"
                             f"{cierre_sweep}",
                             parse_mode="Markdown")
