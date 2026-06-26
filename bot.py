@@ -254,14 +254,17 @@ def obtener_cot_report():
         lineas = contenido.strip().split("\n")
         linea_emini = None
         for linea in lineas:
-            # E-MINI S&P 500 puro — excluir Financial/Health/Industrial/etc.
+            # S&P 500 CONSOLIDATED — combina estándar + e-mini + micro.
+            # Es el posicionamiento COMPLETO de los tiburones (el que validamos
+            # a mano). Antes se leía el E-MINI solo (13874A), ahora el
+            # Consolidated (13874+).
             U = linea.upper()
-            if U.startswith('"E-MINI S&P 500 -') or U.startswith("E-MINI S&P 500 -"):
+            if U.startswith('"S&P 500 CONSOLIDATED') or U.startswith("S&P 500 CONSOLIDATED"):
                 linea_emini = linea
                 break
 
         if linea_emini is None:
-            print("  [COT] No se encontró E-mini S&P 500 en el CSV")
+            print("  [COT] No se encontró S&P 500 Consolidated en el CSV")
             return _cot_proxy_fallback()
 
         # csv.reader respeta las comillas del nombre (que contiene comas/guiones)
@@ -274,13 +277,21 @@ def obtener_cot_report():
             return int(campos[i].strip().replace('"', '').replace(',', ''))
 
         fecha_str = campos[2].strip().strip('"')
-        # ── Mapeo TFF (Traders in Financial Futures) ─────────
-        # [7] OI total | [8/9] Dealer L/S | [10/11] Asset Mgr L/S
-        # [12/13] Leveraged Funds L/S (TIBURONES) | [14/15] Other L/S
-        lev_long   = _num(12)   # Leveraged Funds long  — hedge funds
-        lev_short  = _num(13)   # Leveraged Funds short
-        am_long    = _num(10)   # Asset Managers long   — institucional (contexto)
-        am_short   = _num(11)   # Asset Managers short
+        nombre_contrato = campos[0].strip().strip('"')   # nombre tal cual del CSV
+        # ── Mapeo TFF (Traders in Financial Futures) CORREGIDO ─────────
+        # El formato TFF incluye columna SPREADING por cada categoría.
+        # Tras la metadata (nombre, fechas, código, CME, 00, 138):
+        # [7] OI total
+        # [8/9/10]   Dealer        Long/Short/Spreading
+        # [11/12/13] Asset Manager Long/Short/Spreading
+        # [14/15/16] Leveraged     Long/Short/Spreading  ← TIBURONES
+        # [17/18/19] Other         Long/Short/Spreading
+        # El mapeo viejo usaba [12/13] (= Asset Mgr Short/Spread) por error,
+        # dando un neto falso (+85,492). Lev Funds reales están en [14/15].
+        lev_long   = _num(14)   # Leveraged Funds long  — hedge funds
+        lev_short  = _num(15)   # Leveraged Funds short
+        am_long    = _num(11)   # Asset Managers long   — institucional (contexto)
+        am_short   = _num(12)   # Asset Managers short
         oi_total   = _num(7)
 
         neto       = lev_long - lev_short        # NETO de los tiburones
@@ -307,6 +318,7 @@ def obtener_cot_report():
             "disponible":           True,
             "fuente":               "CFTC_REAL",
             "fecha_reporte":        fecha_str,
+            "contrato":             nombre_contrato,
         })
         print(f"  [COT] ✅ REAL CFTC (Lev Funds) — Fecha:{fecha_str} | "
               f"Long:{lev_long:,} | Short:{lev_short:,} | Neto:{neto:+,} | Sesgo:{sesgo} "
@@ -4750,11 +4762,14 @@ while True:
             # Reporte COT Estimado — solo miércoles a las 9:00 ET
             enviar_reporte_cot_estimado_miercoles()
             # ── COT Real CFTC — viernes al cierre (4:00 PM ET = 2:00 PM HN) ──
-            # CFTC publica 3:30 PM ET. Solo intentar DESPUÉS de esa hora
-            # para no quemar el intento en la madrugada con el COT viejo.
+            # CFTC LIBERA a las 3:30 PM ET pero el archivo descargable recién
+            # aparece en el sitio web a las 6:30 PM ET. Intentar a las 8:30 PM ET
+            # (= 6:30 PM HN) da 2h de colchón tras la publicación. Antes el bot
+            # buscaba a las 3:30 PM ET y no encontraba nada (archivo aún no subido),
+            # reintentando cada minuto → causaba el spam de mensajes COT.
             if ahora_ny.weekday() == 4:  # viernes
                 hora_min_vie = ahora_ny.hour * 60 + ahora_ny.minute
-                if (hora_min_vie >= 15 * 60 + 30 and
+                if (hora_min_vie >= 20 * 60 + 30 and   # 8:30 PM ET = 6:30 PM HN
                         cot_viernes_procesado["dia"] != ahora_ny.date() and
                         not es_festivo_hoy()):   # festivo federal → CFTC no publica
                     print("  [COT_VIERNES] 📥 Descargando COT real CFTC...")
@@ -4783,6 +4798,7 @@ while True:
                                 ratio_am = (am_l / am_s) if am_s else 0
                                 bot.send_message(TELEGRAM_CHAT_ID,
                                     f"📊 *COT REAL CFTC — VIERNES*\n"
+                                    f"📄 Contrato: `{cot_cache.get('contrato','N/D')}`\n"
                                     f"────────────────────────────\n"
                                     f"🦈 *Tiburones (Leveraged Funds):*\n"
                                     f"{emoji_v} Sesgo: `{sesgo_v.replace('_',' ')}`\n"
@@ -4794,9 +4810,7 @@ while True:
                                     f"   Long: `{am_l:,}` | Short: `{am_s:,}` | Ratio: `{ratio_am:.2f}`\n"
                                     f"📅 Fecha corte: `{fecha_v}`\n"
                                     f"────────────────────────────\n"
-                                    f"🔬 Sin estimado previo que validar.\n"
-                                    f"🚀 Acumulación iniciada — reporte estimado el miércoles, "
-                                    f"validación el próximo viernes.",
+                                    f"🦈 Posicionamiento institucional real (CFTC).",
                                     parse_mode="Markdown")
                                 print("  [COT_VIERNES] 📊 COT real enviado (sin validación)")
                             except Exception as e:
