@@ -4776,45 +4776,43 @@ while True:
                     if obtener_cot_report():
                         cot_viernes_procesado["dia"] = ahora_ny.date()
                         print("  [COT_VIERNES] ✅ COT real actualizado")
-                        if cot_estimado_cache["disponible"]:
-                            validar_cot_estimado_vs_real()
-                            guardar_estado_cot_github()
-                        else:
-                            # Sin estimado que validar (primer viernes o reinicio)
-                            # → informar COT real e iniciar acumulación nueva
-                            iniciar_acumulacion_cot()
-                            guardar_estado_cot_github()
-                            try:
-                                sesgo_v = cot_cache.get("sesgo", "N/D")
-                                neto_v  = cot_cache.get("neto_largo", 0) or 0
-                                long_v  = cot_cache.get("longs", 0) or 0
-                                short_v = cot_cache.get("shorts", 0) or 0
-                                am_l    = cot_cache.get("am_long", 0) or 0
-                                am_s    = cot_cache.get("am_short", 0) or 0
-                                am_v    = cot_cache.get("neto_am", 0) or 0
-                                fecha_v = cot_cache.get("fecha_reporte", "N/D")
-                                emoji_v = "🟢" if "ALCISTA" in sesgo_v else ("🔴" if "BAJISTA" in sesgo_v else "⚪")
-                                ratio_v  = (long_v / short_v) if short_v else 0
-                                ratio_am = (am_l / am_s) if am_s else 0
-                                bot.send_message(TELEGRAM_CHAT_ID,
-                                    f"📊 *COT REAL CFTC — VIERNES*\n"
-                                    f"📄 Contrato: `{cot_cache.get('contrato','N/D')}`\n"
-                                    f"────────────────────────────\n"
-                                    f"🦈 *Tiburones (Leveraged Funds):*\n"
-                                    f"{emoji_v} Sesgo: `{sesgo_v.replace('_',' ')}`\n"
-                                    f"📈 Neto: `{neto_v:+,}` contratos\n"
-                                    f"   Long: `{long_v:,}` | Short: `{short_v:,}` | Ratio: `{ratio_v:.2f}`\n"
-                                    f"────────────────────────────\n"
-                                    f"🏛️ *Asset Managers (institucional):*\n"
-                                    f"   Neto: `{am_v:+,}`\n"
-                                    f"   Long: `{am_l:,}` | Short: `{am_s:,}` | Ratio: `{ratio_am:.2f}`\n"
-                                    f"📅 Fecha corte: `{fecha_v}`\n"
-                                    f"────────────────────────────\n"
-                                    f"🦈 Posicionamiento institucional real (CFTC).",
-                                    parse_mode="Markdown")
-                                print("  [COT_VIERNES] 📊 COT real enviado (sin validación)")
-                            except Exception as e:
-                                print(f"  [COT_VIERNES] Error enviando: {e}")
+                        # El COT estimado viejo fue jubilado, así que ya NO se
+                        # bifurca: siempre se guarda el estado y se ENVÍA el
+                        # mensaje del COT real a Telegram. (Antes el mensaje
+                        # estaba en un else que no se ejecutaba → descargaba
+                        # pero no enviaba.)
+                        guardar_estado_cot_github()
+                        try:
+                            sesgo_v = cot_cache.get("sesgo", "N/D")
+                            neto_v  = cot_cache.get("neto_largo", 0) or 0
+                            long_v  = cot_cache.get("longs", 0) or 0
+                            short_v = cot_cache.get("shorts", 0) or 0
+                            am_l    = cot_cache.get("am_long", 0) or 0
+                            am_s    = cot_cache.get("am_short", 0) or 0
+                            am_v    = cot_cache.get("neto_am", 0) or 0
+                            fecha_v = cot_cache.get("fecha_reporte", "N/D")
+                            emoji_v = "🟢" if "ALCISTA" in sesgo_v else ("🔴" if "BAJISTA" in sesgo_v else "⚪")
+                            ratio_v  = (long_v / short_v) if short_v else 0
+                            ratio_am = (am_l / am_s) if am_s else 0
+                            bot.send_message(TELEGRAM_CHAT_ID,
+                                f"📊 *COT REAL CFTC — VIERNES*\n"
+                                f"📄 Contrato: `{cot_cache.get('contrato','N/D')}`\n"
+                                f"────────────────────────────\n"
+                                f"🦈 *Tiburones (Leveraged Funds):*\n"
+                                f"{emoji_v} Sesgo: `{sesgo_v.replace('_',' ')}`\n"
+                                f"📈 Neto: `{neto_v:+,}` contratos\n"
+                                f"   Long: `{long_v:,}` | Short: `{short_v:,}` | Ratio: `{ratio_v:.2f}`\n"
+                                f"────────────────────────────\n"
+                                f"🏛️ *Asset Managers (institucional):*\n"
+                                f"   Neto: `{am_v:+,}`\n"
+                                f"   Long: `{am_l:,}` | Short: `{am_s:,}` | Ratio: `{ratio_am:.2f}`\n"
+                                f"📅 Fecha corte: `{fecha_v}`\n"
+                                f"────────────────────────────\n"
+                                f"🦈 Posicionamiento institucional real (CFTC).",
+                                parse_mode="Markdown")
+                            print("  [COT_VIERNES] 📊 COT real enviado")
+                        except Exception as e:
+                            print(f"  [COT_VIERNES] Error enviando: {e}")
             elapsed = time.time() - inicio_ciclo
             time.sleep(max(0, 60 - elapsed))
             contador_ciclos += 1
