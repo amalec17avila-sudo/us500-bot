@@ -2957,6 +2957,35 @@ OPEX_FECHAS_2026 = {
     "2026-11-20", "2026-12-18",
 }
 TRIPLE_WITCHING_2026 = {"2026-03-20", "2026-06-18", "2026-09-18", "2026-12-18"}
+
+# ── Cierres de trimestre y fin de mes 2026 ───────────────────
+# En estas fechas hay rebalanceo institucional (fondos ajustan
+# posiciones al cierre del periodo) → flujos grandes y a veces
+# movimientos bruscos al final del día. El cierre de TRIMESTRE es
+# el más fuerte (rebalanceo trimestral de pensiones/índices).
+# Nota: son el último día HÁBIL del periodo (no el 31 si cae finde).
+CIERRE_TRIMESTRE_2026 = {"2026-03-31", "2026-06-30", "2026-09-30", "2026-12-31"}
+FIN_DE_MES_2026 = {
+    "2026-01-30", "2026-02-27", "2026-03-31", "2026-04-30",
+    "2026-05-29", "2026-06-30", "2026-07-31", "2026-08-31",
+    "2026-09-30", "2026-10-30", "2026-11-30", "2026-12-31",
+}
+
+def contexto_periodo():
+    """
+    Detecta si HOY es cierre de trimestre o fin de mes (rebalanceo).
+    Devuelve el texto de aviso para el pre-market, o "" si no aplica.
+    El trimestre tiene prioridad sobre el fin de mes (es más fuerte).
+    """
+    hoy_str = hora_ny().strftime("%Y-%m-%d")
+    if hoy_str in CIERRE_TRIMESTRE_2026:
+        return ("\n📅 *HOY CIERRE DE TRIMESTRE* — rebalanceo institucional fuerte.\n"
+                "   Esperá flujos grandes y posibles movimientos bruscos al cierre.")
+    if hoy_str in FIN_DE_MES_2026:
+        return ("\n📅 *HOY FIN DE MES* — rebalanceo de carteras.\n"
+                "   Puede haber flujos institucionales al cierre.")
+    return ""
+
 charm_alertado = {"dia": None}
 
 def contexto_opex():
@@ -3948,6 +3977,13 @@ def enviar_pre_apertura():
                 opex_texto = "\n📌 Post-OPEX — flujos liberados, más dirección probable"
         except: pass
 
+        # ── Contexto de periodo (cierre trimestre / fin de mes) ──
+        periodo_texto = ""
+        try:
+            periodo_texto = contexto_periodo()
+        except Exception as e:
+            print(f"  [PERIODO] Error: {e}")
+
         # ── Índice de Tiburones (reemplaza al COT estimado viejo) ──
         tiburones_texto = ""
         try:
@@ -3965,6 +4001,7 @@ def enviar_pre_apertura():
                f"🌍 Macro: `{macro_imp}`"
                f"{gex_texto}"
                f"{opex_texto}"
+               f"{periodo_texto}"
                f"{calendario_texto}"
                f"{tiburones_texto}")
         try:
@@ -4304,11 +4341,17 @@ Responde en español en EXACTAMENTE 5 líneas cortas, sin asteriscos, sin títul
 
 def detectar_contradiccion_institucional(resultado):
     """
-    Detecta contradicciones institucionales en AMBAS direcciones:
-    - ALCISTA: Macro bajista + Dark Pool ACUMULANDO
-    - BAJISTA: Macro alcista + Dark Pool DISTRIBUYENDO
-    - None: sin contradicción
+    DESACTIVADA (29-jun): toda la lógica de esta alerta dependía del dark
+    pool proxy (yfinance), que está roto — da "MOMENTUM 20.0%" clavado y
+    seguía apareciendo en el pre-market ("CONTRADICCIÓN INSTITUCIONAL
+    DETECTADA / Dark Pool: MOMENTUM BAJISTA VISIBLE 20.0%"). Como el dark
+    pool ya se neutralizó del score y de la señal, esta alerta queda sin
+    fundamento. Se devuelve None siempre para que NO dispare. Se conserva
+    el código viejo abajo (inalcanzable) para reactivarla cuando haya dark
+    pool REAL (FINRA ATS o servicio pago).
     """
+    return None
+    # --- código viejo deshabilitado (dependía del dark pool roto) ---
     detalle      = resultado["detalle"]
     macro_imp    = contexto_macro.get("impacto", "")
     dp           = detalle.get("dark_pool", {})
