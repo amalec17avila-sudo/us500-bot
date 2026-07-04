@@ -58,6 +58,9 @@ TELEGRAM_TOKEN    = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID  = os.environ.get("TELEGRAM_CHAT_ID")
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY")
 TRADIER_TOKEN     = os.environ.get("TRADIER_TOKEN")  # Opcional — greeks reales
+# URL del Apps Script que recibe cada lectura de sweeps para la app web
+# (dashboard de seguimiento). Opcional: si está vacía, no se envía nada.
+DASHBOARD_URL     = os.environ.get("DASHBOARD_URL", "")
 
 for var, nombre in [
     (TELEGRAM_TOKEN,    "TELEGRAM_TOKEN"),
@@ -760,6 +763,7 @@ def iniciar_acumulacion_cot():
     })
 
     print(f"  [COT_EST] 🚀 Iniciando estimación semana {semana+1} — base: {cot_cache['neto_largo']:+,}")
+
 
 
 def acumular_senales_cot():
@@ -1979,6 +1983,60 @@ pc_semanal_cache = {
     "sesgo":                "NEUTRAL",
 }
 
+
+def _post_dashboard(payload):
+    """
+    Trabajo real del envío al dashboard — corre en un thread daemon para
+    no bloquear el loop principal. Timeout corto y errores silenciosos:
+    si el Apps Script está caído, el bot sigue operando igual.
+    """
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            DASHBOARD_URL, data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST")
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            resp.read()  # drena la respuesta; Apps Script devuelve JSON simple
+        print(f"  [DASHBOARD] 📤 Lectura enviada — balance ${payload.get('balance',0):,.0f}")
+    except Exception as e:
+        # Silencioso a propósito: el dashboard es secundario, nunca debe
+        # tumbar ni frenar el envío de señales a Telegram.
+        print(f"  [DASHBOARD] Envío falló (ignorado): {e}")
+
+
+def enviar_sweep_dashboard(sweep, balance_actual, ahora_ny):
+    """
+    Manda UNA lectura de sweeps al Apps Script (Google Sheets) para la app
+    web de seguimiento. Se llama en CADA ciclo de 5 min con sweep detectado
+    (no solo en las alertas), para que la web tenga la trayectoria completa
+    del balance. El POST se hace en un thread daemon: no bloquea el loop.
+    Si DASHBOARD_URL no está configurada, no hace nada.
+    """
+    if not DASHBOARD_URL:
+        return
+    try:
+        # Hora de Honduras (UTC-6) junto a la de NY, como pidió el usuario
+        hora_hn = ahora_ny.astimezone(pytz.timezone("America/Tegucigalpa"))
+        payload = {
+            "fecha":       ahora_ny.strftime("%Y-%m-%d"),
+            "hora_et":     ahora_ny.strftime("%H:%M:%S"),
+            "hora_hn":     hora_hn.strftime("%H:%M:%S"),
+            "ts":          time.time(),
+            "calls_usd":   round(float(sweep.get("prima_calls", 0)), 2),
+            "puts_usd":    round(float(sweep.get("prima_puts", 0)), 2),
+            "balance":     round(float(balance_actual), 2),
+            "tipo":        sweep.get("tipo", "NEUTRAL"),
+            "contratos_calls": int(sweep.get("contratos_calls", 0)),
+            "contratos_puts":  int(sweep.get("contratos_puts", 0)),
+            "strikes_calls":   int(sweep.get("strikes_calls", 0)),
+            "strikes_puts":    int(sweep.get("strikes_puts", 0)),
+            "expiracion":  sweep.get("expiracion", ""),
+        }
+        # Disparar en thread daemon — no esperamos la respuesta
+        threading.Thread(target=_post_dashboard, args=(payload,), daemon=True).start()
+    except Exception as e:
+        print(f"  [DASHBOARD] Error armando payload: {e}")
 
 
 def _regimen_gamma(vix_nivel=None):
@@ -4107,10 +4165,15 @@ cot_est_reporte_enviado = {"semana": None}
 
 def enviar_reporte_cot_estimado_miercoles():
     """
-    Envía reporte COT Estimado cada miércoles a las 9:00 ET (7:00 HN)
-    antes de la apertura del mercado.
-    Ventaja: tenemos el estimado 3 días antes que el COT real de la CFTC.
+    DESACTIVADA (1-jul): el COT Estimado viejo fue jubilado y reemplazado
+    por el Índice de Tiburones, así que este reporte semanal de los
+    miércoles quedó sin fundamento (mostraba un neto estimado en contratos
+    que ya no se calcula). Se devuelve de inmediato para que NO envíe nada.
+    Se conserva el código viejo abajo (inalcanzable) por si algún día se
+    reactiva con el índice como fuente.
     """
+    return
+    # --- código viejo deshabilitado (dependía del COT estimado jubilado) ---
     ahora = hora_ny()
 
     # Solo miércoles (weekday=2)
@@ -5100,6 +5163,16 @@ while True:
                     if len(hist) > 8:   # mantener las últimas 8 lecturas
                         hist.pop(0)
                     sweep_cache["historial_balance"] = hist
+
+                # ── Envío a la app de seguimiento (dashboard) ───────
+                # Se manda CADA lectura de 5 min (no solo las que alertan),
+                # para que la web tenga la trayectoria completa del balance.
+                # No bloquea el loop: corre en un thread daemon con timeout
+                # corto y try/except silencioso.
+                try:
+                    enviar_sweep_dashboard(sweep, balance_actual, ahora_ny)
+                except Exception as e:
+                    print(f"  [DASHBOARD] Error preparando envío: {e}")
 
                 # ── Decisión de alerta (anti "perder el tren") ──────
                 # Reglas para enviar alerta:
