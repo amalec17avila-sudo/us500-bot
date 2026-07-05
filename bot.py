@@ -998,13 +998,16 @@ def calcular_indice_tiburones():
     Combina las huellas observables del posicionamiento de Leveraged
     Funds en un sesgo direccional con confluencia.
 
-    Huellas (cada una vota -1/0/+1 con una fuerza 0-1):
-      1. CME OI         (sube/baja)            — peso 1.2 (directa)
-      2. Volumen fut.   (direccional)          — peso 0.8 (indirecta)
-      3. Sweeps         (calls vs puts netos)  — peso 1.5 (la más directa)
-      4. Dark Pool      (acum/distrib)         — peso 1.0 (inferida)
-      5. Basis          (futuro vs spot)       — peso 0.9 (indirecta)
-      6. Roll/term      — PENDIENTE de datos confiables (no se usa)
+    Huellas ACTIVAS (cada una vota -1/0/+1 con una fuerza 0-1):
+      1. CME OI   (sube/baja)            — peso 1.2 (directa)
+      2. Sweeps   (calls vs puts netos)  — peso 1.5-2.0 (la más directa;
+                  solo cuenta con mercado abierto, ver fix pre-market)
+
+    Huellas RETIRADAS por datos no confiables (yfinance):
+      - Volumen fut. (5-jul): 0.1-0.4x clavado, sin relación con el flujo
+      - Dark Pool (23-jun): proxy 20% clavado por bug de clamp
+      - Basis (23-jun): swings imposibles por desfase horario /ES vs ^GSPC
+      - Roll/term: nunca implementada (sin fuente confiable en yfinance)
 
     Suma ponderada → dirección. Dispersión de votos → distingue
     neutral por consenso (todos tibios) de neutral por conflicto
@@ -1033,9 +1036,15 @@ def calcular_indice_tiburones():
     #      (ej. +220M → +190M), hay agotamiento aunque el signo siga
     #      igual — el precio deja de seguir el movimiento. La clave no
     #      es el signo sino la DERIVADA del balance.
+    #  (C) PRE-MARKET: antes de la apertura (9:30 ET) los sweeps 0DTE que
+    #      quedan en el cache son del día ANTERIOR — contratos ya vencidos,
+    #      data muerta que no dice nada del día de hoy. Solo se cuenta la
+    #      huella de sweeps con el mercado ABIERTO. Así el índice del
+    #      pre-market se arma con las demás huellas (CME OI, etc.) sin
+    #      contaminarse con flujo caduco.
     prima_c = sweep_cache.get("prima_calls_hoy", 0)
     prima_p = sweep_cache.get("prima_puts_hoy", 0)
-    if (sweep_cache.get("ultimo_sweep") and prima_c + prima_p > 0):
+    if (mercado_abierto() and sweep_cache.get("ultimo_sweep") and prima_c + prima_p > 0):
         balance = prima_c - prima_p
         abs_bal = abs(balance)
 
@@ -1108,10 +1117,16 @@ def calcular_indice_tiburones():
     # real del S&P es de pocos puntos; su aporte direccional era
     # marginal incluso bien calculado. Se quita por ruido.
 
-    # ── Huella 2: Volumen direccional de futuros ─────────────────
-    hv = _huella_volumen_futuros()
-    if hv:
-        huellas["Volumen"] = {**hv, "peso": 0.8}
+    # ── Huella 2: Volumen direccional de futuros — RETIRADA (5-jul) ──
+    # El volumen de /ES vía yfinance da valores no confiables (0.1-0.4x
+    # clavado, sin relación con el flujo real), así que su voto era ruido.
+    # Se retira del índice igual que Dark Pool y Basis. La función
+    # _huella_volumen_futuros() se conserva definida por si en el futuro
+    # se conecta una fuente de volumen confiable (CME directo o de pago),
+    # pero ya no vota.
+    # hv = _huella_volumen_futuros()
+    # if hv:
+    #     huellas["Volumen"] = {**hv, "peso": 0.8}
 
     # ── Huella 6: Roll/term structure — PENDIENTE ────────────────
     # No hay fuente confiable de contratos por vencimiento en yfinance.
@@ -3556,14 +3571,18 @@ def calcular_score_total(datos, minutos_apertura):
     componentes = {
         "delta_volumen":   d_vol["score"],
         "absorcion":       absorc["score"],
-        "divergencia_qqq": div_qqq["score"],
-        "divergencia_tlt": div_tlt["score"],
+        # divergencia_qqq NEUTRALIZADA (5-jul): journal 88 señales → 29% win
+        # rate. Voto puesto en 0. Se sigue calculando y mostrando en detalle,
+        # pero ya no suma al score. (La función divergencia_spy_qqq sigue viva.)
+        "divergencia_qqq": 0,
+        "divergencia_tlt": div_tlt["score"],   # intacto (útil vs tasas/UST10Y)
         "vix_ratio":       vix_ratio["score"],
         "move_index":      move["score"],
         "dxy":             dxy["score"],
         "gex":             gex["score"],
         "dark_pool":       0,  # NEUTRALIZADO 24-jun: el proxy yfinance da 20% clavado (bug clamp), daba MOMENTUM ALCISTA falso y contaminaba el score con sesgo alcista. Se pone en 0 hasta integrar dark pool REAL (servicio pago). La función obtener_dark_pool sigue viva para no romper otras referencias, pero su voto ya no suma al score.
-        "patron_apertura": p_hora["score"] if p_hora["activo"] else 0,
+        # patron_apertura NEUTRALIZADO (5-jul): journal → 38% win rate. Voto 0.
+        "patron_apertura": 0,
         "posicion_rango":  pos_rango["score"],
         "liquidez":        liquidez["score"],
         "cot":             cot_score_ajustado,
@@ -3571,11 +3590,13 @@ def calcular_score_total(datos, minutos_apertura):
         "vvix":            vvix["score"],
         "put_call":        put_call["score"],
         "rotacion":        rotacion["score"],
-        "breadth":         breadth["score"],
+        # breadth NEUTRALIZADO (5-jul): journal → 30% win rate. Voto 0.
+        "breadth":         0,
         "fear_greed":      fear_greed["score"],
         "gex_0dte":        gex_0dte["score"],
-        "vol_control":     vol_ctl["score"],
-        "credito_hyg":     credito["score"],
+        # vol_control NEUTRALIZADO (5-jul): journal → 25% win rate. Voto 0.
+        "vol_control":     0,
+        "credito_hyg":     credito["score"],   # intacto (avisó bien; se usa para tendencias)
         "vwap":            vwap_r["score"],
     }
 
@@ -4402,79 +4423,18 @@ Responde en español en EXACTAMENTE 5 líneas cortas, sin asteriscos, sin títul
 # === ALERTAS TELEGRAM ===========================================
 # ================================================================
 
-def detectar_contradiccion_institucional(resultado):
-    """
-    DESACTIVADA (29-jun): toda la lógica de esta alerta dependía del dark
-    pool proxy (yfinance), que está roto — da "MOMENTUM 20.0%" clavado y
-    seguía apareciendo en el pre-market ("CONTRADICCIÓN INSTITUCIONAL
-    DETECTADA / Dark Pool: MOMENTUM BAJISTA VISIBLE 20.0%"). Como el dark
-    pool ya se neutralizó del score y de la señal, esta alerta queda sin
-    fundamento. Se devuelve None siempre para que NO dispare. Se conserva
-    el código viejo abajo (inalcanzable) para reactivarla cuando haya dark
-    pool REAL (FINRA ATS o servicio pago).
-    """
-    return None
-    # --- código viejo deshabilitado (dependía del dark pool roto) ---
-    detalle      = resultado["detalle"]
-    macro_imp    = contexto_macro.get("impacto", "")
-    dp           = detalle.get("dark_pool", {})
-    vix_nivel    = detalle.get("vix_nivel", 20)
-    fg           = detalle.get("fear_greed", {})
-    vvix         = detalle.get("vvix", {})
-    pc           = detalle.get("put_call", {})
-    dp_tendencia = dp.get("tendencia", "NEUTRAL")
+# ── Alerta de contradicción institucional: ELIMINADA (5-jul) ──────
+# Toda su lógica dependía del dark pool proxy (yfinance), que está roto
+# (daba "MOMENTUM 20.0%" clavado y contaminaba el pre-market con falsas
+# "CONTRADICCIONES"). El dark pool ya se neutralizó del score y de la
+# señal, así que la alerta quedó sin fundamento y se retira por completo
+# (función detectora, envío y llamada en el loop). Si algún día entra
+# dark pool REAL (FINRA ATS o servicio pago), se reconstruye desde cero
+# con esa fuente confiable.
 
-    macro_bajista    = "BAJISTA" in macro_imp.upper()
-    macro_alcista    = "ALCISTA" in macro_imp.upper()
-    dp_acumulando    = dp_tendencia in ["ACUMULANDO", "MOMENTUM_ALCISTA"]
-    dp_distribuyendo = dp_tendencia in ["DISTRIBUYENDO", "MOMENTUM_BAJISTA"]
-
-    # CONTRADICCIÓN ALCISTA: Macro bajista + Dark Pool acumulando
-    if macro_bajista and dp_acumulando:
-        vix_bajo   = vix_nivel < 18
-        fg_codicia = fg.get("valor", 50) > 60 if fg.get("disponible") else False
-        vvix_bajo  = vvix.get("score", 0) >= 0 if vvix.get("disponible") else True
-        pc_neutro  = pc.get("ratio", 1.0) < 1.1 if pc.get("disponible") else True
-        if sum([vix_bajo, fg_codicia, vvix_bajo, pc_neutro]) >= 3:
-            return "ALCISTA"
-
-    # CONTRADICCIÓN BAJISTA: Macro alcista + Dark Pool distribuyendo
-    if macro_alcista and dp_distribuyendo:
-        vix_alto  = vix_nivel > 18
-        fg_miedo  = fg.get("valor", 50) < 45 if fg.get("disponible") else False
-        vvix_alto = vvix.get("score", 0) < 0 if vvix.get("disponible") else False
-        pc_alto   = pc.get("ratio", 1.0) > 1.1 if pc.get("disponible") else False
-        if sum([vix_alto, fg_miedo, vvix_alto, pc_alto]) >= 2:
-            return "BAJISTA"
-
-    return None
-
-def enviar_alerta_contradiccion(resultado, tipo="ALCISTA"):
-    detalle   = resultado["detalle"]
-    precio    = detalle["precio"]
-    gex       = detalle.get("gex", {})
-    flip      = gex.get("gamma_flip", gex_niveles.get("gamma_flip", "N/D"))
-    call_wall = gex_niveles.get("call_wall", "N/D")
-    vix_nivel = detalle.get("vix_nivel", "N/D")
-    dp        = detalle.get("dark_pool", {})
-    fg        = detalle.get("fear_greed", {})
-    fg_val    = fg.get("valor", "N/D") if fg.get("disponible") else "N/D"
-    msg = (f"⚡ *CONTRADICCIÓN INSTITUCIONAL DETECTADA*\n{'─'*30}\n"
-           f"💵 Precio: `{precio}`\n"
-           f"🌍 Macro: `BAJISTA` — pero institucionales COMPRANDO\n{'─'*30}\n"
-           f"🏦 Dark Pool: `{dp.get('interpretacion','N/D')} {dp.get('ratio',0):.1%}`\n"
-           f"📉 VIX: `{vix_nivel}` — bajo, sin pánico\n"
-           f"🌡️ Fear/Greed: `{fg_val}` — codicia\n{'─'*30}\n"
-           f"⚡ GEX Flip: `{flip}` | Call Wall: `{call_wall}`\n"
-           f"⚠️ *Los institucionales ignoran el ruido macro.*\n"
-           f"📈 Posible movimiento alcista encubierto.")
-    try:
-        bot.send_message(TELEGRAM_CHAT_ID, msg, parse_mode="Markdown")
-        print("  [CONTRADICCIÓN] ⚡ Alerta enviada")
-    except Exception as e:
-        print(f"  [CONTRADICCIÓN] Error: {e}")
-
-contradiccion_cache = {"enviada": False, "dia": None}
+# Flag de "primer ciclo del día" — dispara la acumulación diaria de
+# señales para el COT estimado una sola vez por jornada.
+ciclo_diario_cache = {"dia": None}
 
 def barra_score(score):
     abs_s = abs(score)
@@ -5333,20 +5293,16 @@ while True:
                 enviar_alerta_distribucion(resultado)
                 posicion_activa["alerta_distribucion_enviada"] = True
 
-        # ── Contradicción institucional ───────────────────────
+        # ── Acumulación diaria de señales para COT estimado ───
+        # (Antes vivía dentro del bloque de "contradicción institucional",
+        #  ya retirado. Se conserva con su propio flag de primer ciclo.)
         ahora_dia = ahora_ny.date()
-        if contradiccion_cache["dia"] != ahora_dia:
-            contradiccion_cache["enviada"] = False
-            contradiccion_cache["dia"]     = ahora_dia
-            # Acumular señales del día para COT estimado
+        if ciclo_diario_cache["dia"] != ahora_dia:
+            ciclo_diario_cache["dia"] = ahora_dia
             try:
                 acumular_senales_cot()
             except Exception as e:
                 print(f"  [COT_EST] Error acumulando: {e}")
-        tipo_contradiccion = detectar_contradiccion_institucional(resultado)
-        if not contradiccion_cache["enviada"] and tipo_contradiccion:
-            enviar_alerta_contradiccion(resultado, tipo_contradiccion)
-            contradiccion_cache["enviada"] = True
 
         # ── Divergencia precio-Dark Pool ──────────────────────
         if datos:
