@@ -2020,13 +2020,19 @@ def _post_dashboard(payload):
         print(f"  [DASHBOARD] Envío falló (ignorado): {e}")
 
 
-def enviar_sweep_dashboard(sweep, balance_actual, ahora_ny):
+def enviar_sweep_dashboard(sweep, balance_actual, ahora_ny, precio_us500=None):
     """
     Manda UNA lectura de sweeps al Apps Script (Google Sheets) para la app
     web de seguimiento. Se llama en CADA ciclo de 5 min con sweep detectado
     (no solo en las alertas), para que la web tenga la trayectoria completa
     del balance. El POST se hace en un thread daemon: no bloquea el loop.
     Si DASHBOARD_URL no está configurada, no hace nada.
+
+    precio_us500: precio del US500 (^GSPC) en el momento de la lectura. La
+    web lo usa para ver la RELACIÓN sweep→precio: si el balance crece y el
+    precio lo acompaña, el hedge del dealer apareció (el tren sigue); si el
+    balance crece pero el precio no se mueve, el sweep se absorbió (el tren
+    se fue). Es el "espejo" del lado de acciones, inferido del propio precio.
     """
     if not DASHBOARD_URL:
         return
@@ -2041,6 +2047,7 @@ def enviar_sweep_dashboard(sweep, balance_actual, ahora_ny):
             "calls_usd":   round(float(sweep.get("prima_calls", 0)), 2),
             "puts_usd":    round(float(sweep.get("prima_puts", 0)), 2),
             "balance":     round(float(balance_actual), 2),
+            "precio_us500": round(float(precio_us500), 2) if precio_us500 is not None else "",
             "tipo":        sweep.get("tipo", "NEUTRAL"),
             "contratos_calls": int(sweep.get("contratos_calls", 0)),
             "contratos_puts":  int(sweep.get("contratos_puts", 0)),
@@ -5130,7 +5137,7 @@ while True:
                 # No bloquea el loop: corre en un thread daemon con timeout
                 # corto y try/except silencioso.
                 try:
-                    enviar_sweep_dashboard(sweep, balance_actual, ahora_ny)
+                    enviar_sweep_dashboard(sweep, balance_actual, ahora_ny, spy_precio)
                 except Exception as e:
                     print(f"  [DASHBOARD] Error preparando envío: {e}")
 
