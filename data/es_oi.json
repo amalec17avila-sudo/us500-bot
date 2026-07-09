@@ -1,9 +1,9 @@
 {
-  "oi_actual": 1166607,
-  "cambio_diario": 4956,
-  "cambio_semanal": -356703,
-  "fecha": "2026-07-08",
-  "ultima_actualizacion": "2026-07-08T00:57:08.640212",
+  "oi_actual": 1261088,
+  "cambio_diario": -3725,
+  "cambio_semanal": 94481,
+  "fecha": "2026-07-09",
+  "ultima_actualizacion": "2026-07-09T01:07:12.598575",
   "historial": [
     {
       "fecha": "2026-06-09",
@@ -114,6 +114,11 @@
       "fecha": "2026-07-08",
       "oi": 1166607,
       "cambio": 4956
+    },
+    {
+      "fecha": "2026-07-09",
+      "oi": 1261088,
+      "cambio": -3725
     }
   ]
 }
