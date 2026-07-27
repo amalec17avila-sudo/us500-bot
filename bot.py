@@ -2055,6 +2055,41 @@ def enviar_sweep_dashboard(sweep, balance_actual, ahora_ny, precio_us500=None):
             "strikes_puts":    int(sweep.get("strikes_puts", 0)),
             "expiracion":  sweep.get("expiracion", ""),
         }
+        # ── Estructura: GEX + crédito ─────────────────────────
+        def _v(x):
+            return round(float(x), 2) if x is not None else ""
+
+        if gex_niveles.get("disponible"):
+            payload.update({
+                "flip":      _v(gex_niveles.get("gamma_flip")),
+                "call_wall": _v(gex_niveles.get("call_wall")),
+                "put_wall":  _v(gex_niveles.get("put_wall")),
+                "call_oi":   int(gex_niveles.get("call_wall_oi") or 0) or "",
+                "put_oi":    int(gex_niveles.get("put_wall_oi")  or 0) or "",
+            })
+        else:
+            payload.update({"flip": "", "call_wall": "", "put_wall": "",
+                            "call_oi": "", "put_oi": ""})
+
+        if gex_0dte_cache.get("disponible"):
+            payload.update({
+                "gex0_neto": _v(gex_0dte_cache.get("neto")),
+                "flip0":     _v(gex_0dte_cache.get("flip_0dte"))
+                             if gex_0dte_cache.get("flip_confiable") else "",
+            })
+        else:
+            payload.update({"gex0_neto": "", "flip0": ""})
+
+        if credito_cache.get("disponible"):
+            payload.update({
+                "hyg_spy3":  _v(credito_cache.get("spy_3d")),
+                "hyg_hyg3":  _v(credito_cache.get("hyg_3d")),
+                "hyg_score": int(credito_cache.get("score", 0)),
+                "hyg_senal": credito_cache.get("señal", ""),
+            })
+        else:
+            payload.update({"hyg_spy3": "", "hyg_hyg3": "",
+                            "hyg_score": "", "hyg_senal": ""})
         # Disparar en thread daemon — no esperamos la respuesta
         threading.Thread(target=_post_dashboard, args=(payload,), daemon=True).start()
     except Exception as e:
