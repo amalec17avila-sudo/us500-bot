@@ -84,6 +84,11 @@ MODELO_MACRO   = "claude-sonnet-4-5"
 
 # ── Configuración ────────────────────────────────────────────
 UMBRAL_SCORE             = 7
+# Señales de score DESACTIVADAS (9-ago): win rate 35% en 168 señales.
+# El score se sigue calculando (lo usan el journal, agotamiento y rango)
+# pero ya NO se envía a Telegram ni se consulta a Claude por señal.
+# Poner en True para reactivarlas.
+ENVIAR_SENALES_SCORE     = False
 TIEMPO_MIN_ALERTAS       = 15
 UMBRAL_PRECIO_CAMBIO     = 0.003
 SALTO_SCORE_MINIMO       = 2
@@ -5394,7 +5399,7 @@ while True:
         # ── Alertas principales ───────────────────────────────
         if rango_estado.get("suspender"):
             print(f"  → ⏸ Señales suspendidas por detector de rango ({rango_estado['minutos']:.0f} min)")
-        elif score >= UMBRAL_SCORE:
+        elif score >= UMBRAL_SCORE and ENVIAR_SENALES_SCORE:
             ok, razon = cooldown.debe_alertar_alcista(resultado)
             if ok:
                 print(f"  → 🟢 ALCISTA score={score} ({razon}). Consultando Claude...")
@@ -5430,7 +5435,7 @@ while True:
                 print(f"  → ✅ Enviado ({ahora_ny.strftime('%H:%M:%S')} ET)")
             else:
                 print(f"  → ⏸ Alcista {score} bloqueado: {razon}")
-        elif score <= -UMBRAL_SCORE:
+        elif score <= -UMBRAL_SCORE and ENVIAR_SENALES_SCORE:
             ok, razon = cooldown.debe_alertar_bajista(resultado)
             if ok:
                 print(f"  → 🔴 BAJISTA score={score} ({razon}). Consultando Claude...")
