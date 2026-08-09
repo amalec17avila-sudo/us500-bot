@@ -2100,7 +2100,41 @@ def enviar_sweep_dashboard(sweep, balance_actual, ahora_ny, precio_us500=None):
     except Exception as e:
         print(f"  [DASHBOARD] Error armando payload: {e}")
 
+def precio_us500_tradier():
+    """
+    Precio del US500 desde Tradier (SPY × 10).
 
+    Tradier es fuente de pago con datos reales y UN solo ticker, así que
+    no sufre el problema de yfinance (donde una fila se descartaba si
+    cualquiera de los 7 tickers venía atrasado — causa del precio
+    congelado 75 min el 6-ago).
+
+    Devuelve el precio en escala US500, o None si falla. El que llama
+    debe tener fallback a yfinance: nunca quedarse sin precio.
+    """
+    if not TRADIER_TOKEN:
+        return None
+    try:
+        url = "https://api.tradier.com/v1/markets/quotes?symbols=SPY"
+        req = urllib.request.Request(url, headers={
+            "Authorization": f"Bearer {TRADIER_TOKEN}",
+            "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json.loads(resp.read().decode())
+        q = data.get("quotes", {}).get("quote", {})
+        if isinstance(q, list):
+            q = q[0] if q else {}
+        px = q.get("last") or q.get("close")
+        if not px:
+            return None
+        px = float(px)
+        if px <= 0:
+            return None
+        return round(px * 10, 2)
+    except Exception as e:
+        print(f"  [PRECIO_TRADIER] Error: {e}")
+        return None
+    
 def _regimen_gamma(vix_nivel=None):
     """
     Determina si los muros FRENAN (gamma+) o ACELERAN (gamma-).
@@ -3207,11 +3241,33 @@ def descargar_datos():
         tickers = ["^GSPC", "QQQ", "TLT", "^VIX", "^VIX3M", "^MOVE", "DX-Y.NYB"]
         raw = yf.download(tickers, period="2d", interval="1m", progress=False, auto_adjust=True)
         if raw.empty or len(raw) < 50: return None
-        close  = raw["Close"].ffill().dropna()
-        volume = raw["Volume"].ffill().dropna()
-        high   = raw["High"].ffill().dropna()
-        low    = raw["Low"].ffill().dropna()
-        open_  = raw["Open"].ffill().dropna()
+        # ── Fix precio congelado (9-ago) ──────────────────────
+        # Antes: .dropna() borraba la fila entera si CUALQUIER ticker
+        # faltaba. ^MOVE, ^VIX3M y DXY publican más lento que ^GSPC, así
+        # que en la primera hora de sesión se descartaban las filas
+        # nuevas del S&P y el bot se quedaba con un precio viejo
+        # (jueves 6-ago: 75 min congelado). Ahora solo se descarta la
+        # fila si falta el dato del PROPIO S&P; los demás quedan con su
+        # último valor conocido vía ffill.
+        close  = raw["Close"].ffill()
+        volume = raw["Volume"].ffill()
+        high   = raw["High"].ffill()
+        low    = raw["Low"].ffill()
+        open_  = raw["Open"].ffill()
+        if "^GSPC" not in close.columns:
+            return None
+        vivo   = close["^GSPC"].notna()
+        close  = close[vivo]
+        volume = volume[vivo]
+        high   = high[vivo]
+        low    = low[vivo]
+        open_  = open_[vivo]
+        if len(close) < 50:
+            return None
+        
+        
+        
+        
         return {
             "close": close, "volume": volume, "high": high, "low": low, "open": open_,
             "tiene_vix3m": "^VIX3M"   in close.columns and not close["^VIX3M"].isna().all(),
@@ -4947,7 +5003,11 @@ while True:
             contador_ciclos += 1
             continue
 
-        spy_precio = float(datos["close"]["^GSPC"].iloc[-1])
+        # Precio principal desde Tradier; yfinance solo como respaldo.
+        spy_precio = precio_us500_tradier()
+        if spy_precio is None:
+            spy_precio = float(datos["close"]["^GSPC"].iloc[-1])
+            print("  [PRECIO] ⚠️ Tradier no respondió — usando yfinance")
         vix_precio = float(datos["close"]["^VIX"].iloc[-1])
 
         # ── Apertura del mercado ──────────────────────────────
