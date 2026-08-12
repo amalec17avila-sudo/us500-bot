@@ -1,9 +1,9 @@
 {
-  "oi_actual": 1238555,
-  "cambio_diario": -20304,
-  "cambio_semanal": -220513,
-  "fecha": "2026-08-10",
-  "ultima_actualizacion": "2026-08-10T23:56:39.859105",
+  "oi_actual": 0,
+  "cambio_diario": 0,
+  "cambio_semanal": 0,
+  "fecha": "2026-08-12",
+  "error": "CME bloque\u00f3 acceso",
   "historial": [
     {
       "fecha": "2026-06-30",
