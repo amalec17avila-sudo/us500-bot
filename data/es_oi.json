@@ -1,15 +1,10 @@
 {
-  "oi_actual": 0,
-  "cambio_diario": 0,
-  "cambio_semanal": 0,
+  "oi_actual": 1108604,
+  "cambio_diario": -11950,
+  "cambio_semanal": -350464,
   "fecha": "2026-08-14",
-  "error": "CME bloque\u00f3 acceso",
+  "ultima_actualizacion": "2026-08-14T23:43:01.425925",
   "historial": [
-    {
-      "fecha": "2026-07-01",
-      "oi": 1523310,
-      "cambio": -21650
-    },
     {
       "fecha": "2026-07-02",
       "oi": 1349377,
@@ -154,6 +149,11 @@
       "fecha": "2026-08-13",
       "oi": 1011890,
       "cambio": 6270
+    },
+    {
+      "fecha": "2026-08-14",
+      "oi": 1108604,
+      "cambio": -11950
     }
   ]
 }
