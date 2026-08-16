@@ -2134,6 +2134,267 @@ def precio_us500_tradier():
     except Exception as e:
         print(f"  [PRECIO_TRADIER] Error: {e}")
         return None
+# ════════════════════════════════════════════════════════════════
+# WEEKLY DIRECCIONAL + SERVIDOR HTTP
+#
+# QUÉ HACE
+#   1. Calcula el weekly direccional (max pain, walls, ratio P:C) una
+#      vez al día, con la misma lógica del weekly_test.py que ya usás.
+#   2. Guarda la trayectoria diaria en GitHub — así sobrevive a los
+#      redeploys de Railway (igual que el journal y el estado COT).
+#   3. Levanta un servidor HTTP mínimo que sirve esos datos como JSON
+#      al dashboard, sin pasar por Google Sheets.
+#
+# DÓNDE PEGARLO
+#   Justo ANTES de la línea:   def _regimen_gamma(vix_nivel=None):
+#
+# QUÉ MÁS HAY QUE HACER (ver instrucciones aparte):
+#   - Agregar 2 líneas al arranque para levantar el servidor
+#   - Agregar 1 línea en el loop para calcular el weekly cada día
+# ════════════════════════════════════════════════════════════════
+
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+PUERTO_HTTP  = int(os.environ.get("PORT", 8080))
+WEEKLY_URL   = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/weekly.json"
+
+weekly_cache = {
+    "disponible":    False,
+    "expiracion":    None,    # viernes que vence
+    "us500":         None,
+    "max_pain":      None,
+    "call_wall":     None,
+    "put_wall":      None,
+    "call_oi":       None,
+    "put_oi":        None,
+    "ratio_pc":      None,
+    "top_calls":     [],      # [[strike, oi], ...]
+    "top_puts":      [],
+    "trayectoria":   {},      # {"2026-08-10": {...}, ...} por expiración
+    "dia_calculado": None,
+    "sha":           None,    # sha del archivo en GitHub
+}
+
+
+def _viernes_de_la_semana():
+    """Viernes de esta semana en hora ET. Sáb/dom → viernes siguiente."""
+    ahora = hora_ny()
+    wd = ahora.weekday()          # lun=0 ... dom=6
+    delta = (4 - wd) if wd <= 4 else (4 + (7 - wd))
+    return (ahora + timedelta(days=delta)).strftime("%Y-%m-%d")
+
+
+def _tradier_get(url):
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"Bearer {TRADIER_TOKEN}",
+        "Accept": "application/json"})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        return json.loads(r.read().decode())
+
+
+def cargar_weekly_github():
+    """Restaura la trayectoria semanal al arrancar el bot."""
+    try:
+        import base64
+        req = urllib.request.Request(WEEKLY_URL, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api = json.loads(resp.read().decode())
+        weekly_cache["sha"] = api.get("sha")
+        datos = json.loads(base64.b64decode(api.get("content", "")).decode("utf-8"))
+        weekly_cache["trayectoria"] = datos.get("trayectoria", {})
+        print(f"  [WEEKLY] ✅ Trayectoria restaurada — "
+              f"{len(weekly_cache['trayectoria'])} expiraciones")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("  [WEEKLY] 📊 Sin trayectoria previa — se creará al calcular")
+        else:
+            print(f"  [WEEKLY] Error cargando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [WEEKLY] Error cargando: {e}")
+
+
+def guardar_weekly_github():
+    """Persiste la trayectoria en GitHub — sobrevive a los deploys."""
+    if not GH_TOKEN:
+        return
+    try:
+        import base64
+        cuerpo = {"trayectoria": weekly_cache["trayectoria"],
+                  "guardado": hora_ny().strftime("%Y-%m-%d %H:%M ET")}
+        b64 = base64.b64encode(
+            json.dumps(cuerpo, ensure_ascii=False).encode("utf-8")).decode("ascii")
+        body = {"message": f"Weekly {hora_ny().strftime('%Y-%m-%d')}", "content": b64}
+        if weekly_cache["sha"]:
+            body["sha"] = weekly_cache["sha"]
+        req = urllib.request.Request(
+            WEEKLY_URL, data=json.dumps(body).encode("utf-8"),
+            headers={**_gh_headers(), "Content-Type": "application/json"},
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            api = json.loads(resp.read().decode())
+        weekly_cache["sha"] = api.get("content", {}).get("sha")
+        print("  [WEEKLY] 💾 Trayectoria guardada en GitHub")
+    except Exception as e:
+        print(f"  [WEEKLY] Error guardando: {e}")
+
+
+def calcular_weekly():
+    """
+    Calcula el weekly direccional de la expiración del viernes.
+    El OI se actualiza UNA vez al día, así que basta correrlo una vez
+    por jornada — más veces devuelve lo mismo.
+    Todo en escala US500 (SPY × 10).
+    """
+    if not TRADIER_TOKEN:
+        return
+    ahora = hora_ny()
+    if weekly_cache["dia_calculado"] == ahora.date():
+        return                      # ya se calculó hoy
+
+    try:
+        exp = _viernes_de_la_semana()
+
+        # Precio SPY
+        q = _tradier_get("https://api.tradier.com/v1/markets/quotes?symbols=SPY")
+        quote = q.get("quotes", {}).get("quote", {})
+        if isinstance(quote, list):
+            quote = quote[0] if quote else {}
+        spot = float(quote.get("last") or quote.get("close") or 0)
+        if spot <= 0:
+            print("  [WEEKLY] Sin precio SPY")
+            return
+
+        # Cadena de la expiración
+        d = _tradier_get(f"https://api.tradier.com/v1/markets/options/chains"
+                         f"?symbol=SPY&expiration={exp}&greeks=false")
+        ops = d.get("options", {}).get("option", []) or []
+        if not ops:
+            print(f"  [WEEKLY] Sin cadena para {exp}")
+            return
+
+        RANGO = 0.05                # ±5% del precio
+        call_oi, put_oi = {}, {}
+        for op in ops:
+            k = float(op.get("strike", 0))
+            oi = float(op.get("open_interest", 0) or 0)
+            if k <= 0 or oi <= 0 or abs(k - spot) / spot > RANGO:
+                continue
+            t = op.get("option_type", "")
+            if t == "call":  call_oi[k] = call_oi.get(k, 0) + oi
+            elif t == "put": put_oi[k]  = put_oi.get(k, 0) + oi
+
+        if not call_oi and not put_oi:
+            print("  [WEEKLY] Sin OI en el rango")
+            return
+
+        strikes = sorted(set(call_oi) | set(put_oi))
+
+        # Max pain: strike que MINIMIZA el pago total a los compradores
+        def payout(S):
+            pc = sum(oi * max(0.0, S - k) for k, oi in call_oi.items())
+            pp = sum(oi * max(0.0, k - S) for k, oi in put_oi.items())
+            return pc + pp
+        max_pain = min(strikes, key=payout)
+
+        cw = max(call_oi, key=call_oi.get) if call_oi else None
+        pw = max(put_oi,  key=put_oi.get)  if put_oi  else None
+        tot_c = sum(call_oi.values())
+        tot_p = sum(put_oi.values())
+        ratio = (tot_p / tot_c) if tot_c else 0
+
+        x10 = lambda v: round(v * 10) if v else None
+        top_c = [[x10(k), int(v)] for k, v in
+                 sorted(call_oi.items(), key=lambda kv: -kv[1])[:3]]
+        top_p = [[x10(k), int(v)] for k, v in
+                 sorted(put_oi.items(), key=lambda kv: -kv[1])[:3]]
+
+        us500 = round(spot * 10, 2)
+        mp    = x10(max_pain)
+
+        weekly_cache.update({
+            "disponible": True, "expiracion": exp, "us500": us500,
+            "max_pain": mp, "call_wall": x10(cw), "put_wall": x10(pw),
+            "call_oi": int(call_oi.get(cw, 0)), "put_oi": int(put_oi.get(pw, 0)),
+            "ratio_pc": round(ratio, 2),
+            "top_calls": top_c, "top_puts": top_p,
+            "dia_calculado": ahora.date(),
+        })
+
+        # Trayectoria: un snapshot por día, agrupado por expiración
+        hoy = ahora.strftime("%Y-%m-%d")
+        weekly_cache["trayectoria"].setdefault(exp, {})[hoy] = {
+            "max_pain": mp, "call_wall": x10(cw), "put_wall": x10(pw),
+            "cw_oi": int(call_oi.get(cw, 0)), "pw_oi": int(put_oi.get(pw, 0)),
+            "ratio_pc": round(ratio, 2), "us500": us500,
+            # La BRECHA es lo que importa, no el max pain solo: el imán
+            # puede subir y aun así quedar más lejos si el precio sube más.
+            "brecha": round(mp - us500),
+        }
+        # Mantener solo las últimas 6 expiraciones
+        if len(weekly_cache["trayectoria"]) > 6:
+            for k in sorted(weekly_cache["trayectoria"])[:-6]:
+                weekly_cache["trayectoria"].pop(k, None)
+
+        guardar_weekly_github()
+        print(f"  [WEEKLY] ✅ {exp} — MaxPain:{mp} | CW:{x10(cw)} | PW:{x10(pw)} | "
+              f"P:C {ratio:.2f} | brecha {mp - us500:+.0f} pts")
+    except Exception as e:
+        print(f"  [WEEKLY] Error calculando: {e}")
+
+
+# ── Servidor HTTP ────────────────────────────────────────────
+class _Handler(BaseHTTPRequestHandler):
+    def _json(self, obj, code=200):
+        cuerpo = json.dumps(obj, ensure_ascii=False, default=str).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        # El dashboard vive en otro dominio (Cloudflare) → hace falta CORS
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(cuerpo)))
+        self.end_headers()
+        self.wfile.write(cuerpo)
+
+    def do_GET(self):
+        ruta = self.path.split("?")[0].rstrip("/")
+        if ruta in ("", "/health"):
+            self._json({"ok": True, "hora": hora_ny().strftime("%H:%M:%S ET")})
+        elif ruta == "/weekly":
+            if not weekly_cache["disponible"]:
+                self._json({"ok": False, "error": "weekly aún no calculado"})
+                return
+            exp = weekly_cache["expiracion"]
+            self._json({
+                "ok": True,
+                "expiracion": exp,
+                "us500":      weekly_cache["us500"],
+                "max_pain":   weekly_cache["max_pain"],
+                "call_wall":  weekly_cache["call_wall"],
+                "put_wall":   weekly_cache["put_wall"],
+                "call_oi":    weekly_cache["call_oi"],
+                "put_oi":     weekly_cache["put_oi"],
+                "ratio_pc":   weekly_cache["ratio_pc"],
+                "top_calls":  weekly_cache["top_calls"],
+                "top_puts":   weekly_cache["top_puts"],
+                "brecha":     (weekly_cache["max_pain"] - weekly_cache["us500"])
+                              if weekly_cache["max_pain"] else None,
+                "trayectoria": weekly_cache["trayectoria"].get(exp, {}),
+            })
+        else:
+            self._json({"ok": False, "error": "ruta no encontrada"}, 404)
+
+    def log_message(self, *args):
+        pass          # silenciar el log por petición — ensucia Railway
+
+
+def iniciar_servidor_http():
+    """Servidor en thread daemon. Si falla, el bot sigue igual."""
+    try:
+        srv = HTTPServer(("0.0.0.0", PUERTO_HTTP), _Handler)
+        print(f"  [HTTP] ✅ Servidor escuchando en puerto {PUERTO_HTTP}")
+        srv.serve_forever()
+    except Exception as e:
+        print(f"  [HTTP] Error: {e}")
     
 def _regimen_gamma(vix_nivel=None):
     """
@@ -4869,6 +5130,9 @@ def iniciar_polling():
 
 polling_thread = threading.Thread(target=iniciar_polling, daemon=True)
 polling_thread.start()
+# Servidor HTTP — sirve el weekly al dashboard sin pasar por Sheets
+http_thread = threading.Thread(target=iniciar_servidor_http, daemon=True)
+http_thread.start()
 print("  [TELEGRAM] Comandos activos: /long /short /cerrar /posicion")
 
 print("=" * 60)
@@ -4889,6 +5153,8 @@ print("  [INIT] Cargando journal de señales desde GitHub...")
 cargar_journal_github()
 print("  [INIT] Restaurando estado COT Estimado desde GitHub...")
 cargar_estado_cot_github()
+print("  [INIT] Restaurando trayectoria weekly...")
+cargar_weekly_github()
 
 while True:
     try:
@@ -5179,7 +5445,13 @@ while True:
             if (not pc_semanal_cache["ultima_actualizacion"] or
                 (ahora_ny - pc_semanal_cache["ultima_actualizacion"]).total_seconds() / 60 >= 30):
                 obtener_pc_ratio_semanal()
-
+# ── Weekly direccional — una vez al día ──────────────
+        # El OI se actualiza una sola vez por jornada, así que
+        # calcularlo más seguido devuelve lo mismo.
+        try:
+            calcular_weekly()
+        except Exception as e:
+            print(f"  [WEEKLY] Error en loop: {e}")
         # ── CME OI — actualizar cada 60 minutos ──────────────
         if (not cme_oi_cache["ultima_actualizacion"] or
             (ahora_ny - cme_oi_cache["ultima_actualizacion"]).total_seconds() / 60 >= 60):
