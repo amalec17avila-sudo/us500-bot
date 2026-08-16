@@ -2238,58 +2238,77 @@ def guardar_weekly_github():
         print(f"  [WEEKLY] Error guardando: {e}")
 
 
-def calcular_weekly():
-    """
-    Calcula el weekly direccional de la expiración del viernes.
-    El OI se actualiza UNA vez al día, así que basta correrlo una vez
-    por jornada — más veces devuelve lo mismo.
-    Todo en escala US500 (SPY × 10).
-    """
-    if not TRADIER_TOKEN:
-        return
-    ahora = hora_ny()
-    if weekly_cache["dia_calculado"] == ahora.date():
-        return                      # ya se calculó hoy
+# ════════════════════════════════════════════════════════════════
+# WEEKLY DIRECCIONAL v2 — DOS IMANES
+#
+# QUÉ CAMBIA respecto a la v1
+#   SPY vence casi todos los días, no solo los viernes. Eso significa
+#   que hay DOS imanes distintos y conviene no mezclarlos:
+#
+#   1. IMÁN DEL DÍA (próximo vencimiento, rango ±3%)
+#      Es el que pinnea mañana. El precio no recorre 10% en un día,
+#      así que los strikes lejanos son ruido para este cálculo.
+#
+#   2. IMÁN ESTRUCTURAL (viernes / mensual, rango ±10%)
+#      Es el sesgo de fondo. Acá SÍ hay que mirar ancho: en un OPEX
+#      mensual la protección lejana es enorme y define el ratio P:C
+#      real (comprobado 16-ago: con ±5% daba 0.83, con la cadena
+#      completa el ratio real era 3.02).
+#
+# REEMPLAZA
+#   La función calcular_weekly() completa de la v1, y el bloque
+#   "/weekly" del servidor HTTP.
+# ════════════════════════════════════════════════════════════════
 
+def _expiraciones_disponibles():
+    """Lista [(fecha, dias_hasta)] de vencimientos SPY futuros."""
+    d = _tradier_get("https://api.tradier.com/v1/markets/options/"
+                     "expirations?symbol=SPY&includeAllRoots=true")
+    exp = d.get("expirations", {}).get("date", [])
+    if isinstance(exp, str):
+        exp = [exp]
+    hoy = hora_ny().date()
+    out = []
+    for e in exp:
+        try:
+            f = datetime.strptime(e, "%Y-%m-%d").date()
+        except ValueError:
+            continue
+        dias = (f - hoy).days
+        if dias >= 0:
+            out.append((e, dias))
+    return sorted(out, key=lambda x: x[1])
+
+
+def _analizar_expiracion(exp, spot, rango_pct):
+    """
+    Max pain, walls y ratio P:C de UNA expiración.
+    rango_pct define qué tan lejos del precio se miran los strikes:
+    estrecho para el imán del día, ancho para el estructural.
+    Devuelve dict en escala US500, o None si no hay datos.
+    """
     try:
-        exp = _viernes_de_la_semana()
-
-        # Precio SPY
-        q = _tradier_get("https://api.tradier.com/v1/markets/quotes?symbols=SPY")
-        quote = q.get("quotes", {}).get("quote", {})
-        if isinstance(quote, list):
-            quote = quote[0] if quote else {}
-        spot = float(quote.get("last") or quote.get("close") or 0)
-        if spot <= 0:
-            print("  [WEEKLY] Sin precio SPY")
-            return
-
-        # Cadena de la expiración
         d = _tradier_get(f"https://api.tradier.com/v1/markets/options/chains"
                          f"?symbol=SPY&expiration={exp}&greeks=false")
         ops = d.get("options", {}).get("option", []) or []
         if not ops:
-            print(f"  [WEEKLY] Sin cadena para {exp}")
-            return
+            return None
 
-        RANGO = 0.05                # ±5% del precio
         call_oi, put_oi = {}, {}
         for op in ops:
             k = float(op.get("strike", 0))
             oi = float(op.get("open_interest", 0) or 0)
-            if k <= 0 or oi <= 0 or abs(k - spot) / spot > RANGO:
+            if k <= 0 or oi <= 0 or abs(k - spot) / spot > rango_pct:
                 continue
             t = op.get("option_type", "")
             if t == "call":  call_oi[k] = call_oi.get(k, 0) + oi
             elif t == "put": put_oi[k]  = put_oi.get(k, 0) + oi
 
         if not call_oi and not put_oi:
-            print("  [WEEKLY] Sin OI en el rango")
-            return
+            return None
 
         strikes = sorted(set(call_oi) | set(put_oi))
 
-        # Max pain: strike que MINIMIZA el pago total a los compradores
         def payout(S):
             pc = sum(oi * max(0.0, S - k) for k, oi in call_oi.items())
             pp = sum(oi * max(0.0, k - S) for k, oi in put_oi.items())
@@ -2300,46 +2319,119 @@ def calcular_weekly():
         pw = max(put_oi,  key=put_oi.get)  if put_oi  else None
         tot_c = sum(call_oi.values())
         tot_p = sum(put_oi.values())
-        ratio = (tot_p / tot_c) if tot_c else 0
 
         x10 = lambda v: round(v * 10) if v else None
-        top_c = [[x10(k), int(v)] for k, v in
-                 sorted(call_oi.items(), key=lambda kv: -kv[1])[:3]]
-        top_p = [[x10(k), int(v)] for k, v in
-                 sorted(put_oi.items(), key=lambda kv: -kv[1])[:3]]
-
         us500 = round(spot * 10, 2)
-        mp    = x10(max_pain)
+        mp = x10(max_pain)
+
+        return {
+            "expiracion": exp,
+            "max_pain":   mp,
+            "call_wall":  x10(cw),
+            "put_wall":   x10(pw),
+            "call_oi":    int(call_oi.get(cw, 0)) if cw else 0,
+            "put_oi":     int(put_oi.get(pw, 0))  if pw else 0,
+            "oi_calls_total": int(tot_c),
+            "oi_puts_total":  int(tot_p),
+            "ratio_pc":   round(tot_p / tot_c, 2) if tot_c else 0,
+            "brecha":     round(mp - us500) if mp else None,
+            "rango_pct":  rango_pct,
+            "top_calls":  [[x10(k), int(v)] for k, v in
+                           sorted(call_oi.items(), key=lambda kv: -kv[1])[:3]],
+            "top_puts":   [[x10(k), int(v)] for k, v in
+                           sorted(put_oi.items(), key=lambda kv: -kv[1])[:3]],
+        }
+    except Exception as e:
+        print(f"  [WEEKLY] Error analizando {exp}: {e}")
+        return None
+
+
+def calcular_weekly():
+    """
+    Calcula los DOS imanes: el del próximo vencimiento (pinning de
+    mañana) y el estructural del viernes/mensual (sesgo de fondo).
+    El OI se actualiza una vez al día, así que basta una corrida diaria.
+    """
+    if not TRADIER_TOKEN:
+        return
+    ahora = hora_ny()
+    if weekly_cache["dia_calculado"] == ahora.date():
+        return
+
+    try:
+        # Precio SPY
+        q = _tradier_get("https://api.tradier.com/v1/markets/quotes?symbols=SPY")
+        quote = q.get("quotes", {}).get("quote", {})
+        if isinstance(quote, list):
+            quote = quote[0] if quote else {}
+        spot = float(quote.get("last") or quote.get("close") or 0)
+        if spot <= 0:
+            print("  [WEEKLY] Sin precio SPY")
+            return
+        us500 = round(spot * 10, 2)
+
+        exps = _expiraciones_disponibles()
+        if not exps:
+            print("  [WEEKLY] Sin expiraciones")
+            return
+
+        # ── 1. Imán del día: el PRÓXIMO vencimiento con al menos 1 día.
+        # Se descarta el de hoy (0 días): a esa altura ya está resuelto
+        # y no sirve para operar mañana. Si no hay festivos de por medio
+        # suele ser el día siguiente, pero no se asume — se toma el
+        # primero disponible de la lista real de Tradier.
+        exp_dia = next((e for e, d in exps if d >= 1), None)
+        # ── 2. Imán estructural: el viernes de esta semana (o el
+        # siguiente vencimiento en viernes que exista en la cadena).
+        exp_viernes = None
+        for e, d in exps:
+            try:
+                if datetime.strptime(e, "%Y-%m-%d").weekday() == 4 and d >= 1:
+                    exp_viernes = e
+                    break
+            except ValueError:
+                continue
+
+        dia  = _analizar_expiracion(exp_dia, spot, 0.03) if exp_dia else None
+        estr = _analizar_expiracion(exp_viernes, spot, 0.10) if exp_viernes else None
+
+        if not dia and not estr:
+            print("  [WEEKLY] Sin datos en ninguna expiración")
+            return
 
         weekly_cache.update({
-            "disponible": True, "expiracion": exp, "us500": us500,
-            "max_pain": mp, "call_wall": x10(cw), "put_wall": x10(pw),
-            "call_oi": int(call_oi.get(cw, 0)), "put_oi": int(put_oi.get(pw, 0)),
-            "ratio_pc": round(ratio, 2),
-            "top_calls": top_c, "top_puts": top_p,
+            "disponible": True,
+            "us500": us500,
+            "dia": dia,
+            "estructural": estr,
             "dia_calculado": ahora.date(),
         })
 
-        # Trayectoria: un snapshot por día, agrupado por expiración
-        hoy = ahora.strftime("%Y-%m-%d")
-        weekly_cache["trayectoria"].setdefault(exp, {})[hoy] = {
-            "max_pain": mp, "call_wall": x10(cw), "put_wall": x10(pw),
-            "cw_oi": int(call_oi.get(cw, 0)), "pw_oi": int(put_oi.get(pw, 0)),
-            "ratio_pc": round(ratio, 2), "us500": us500,
-            # La BRECHA es lo que importa, no el max pain solo: el imán
-            # puede subir y aun así quedar más lejos si el precio sube más.
-            "brecha": round(mp - us500),
-        }
-        # Mantener solo las últimas 6 expiraciones
-        if len(weekly_cache["trayectoria"]) > 6:
-            for k in sorted(weekly_cache["trayectoria"])[:-6]:
-                weekly_cache["trayectoria"].pop(k, None)
+        # Trayectoria: se guarda la del ESTRUCTURAL, que es la que tiene
+        # sentido seguir día a día (el del día cambia de vencimiento).
+        if estr:
+            hoy = ahora.strftime("%Y-%m-%d")
+            weekly_cache["trayectoria"].setdefault(estr["expiracion"], {})[hoy] = {
+                "max_pain": estr["max_pain"], "call_wall": estr["call_wall"],
+                "put_wall": estr["put_wall"], "cw_oi": estr["call_oi"],
+                "pw_oi": estr["put_oi"], "ratio_pc": estr["ratio_pc"],
+                "us500": us500, "brecha": estr["brecha"],
+            }
+            if len(weekly_cache["trayectoria"]) > 6:
+                for k in sorted(weekly_cache["trayectoria"])[:-6]:
+                    weekly_cache["trayectoria"].pop(k, None)
+            guardar_weekly_github()
 
-        guardar_weekly_github()
-        print(f"  [WEEKLY] ✅ {exp} — MaxPain:{mp} | CW:{x10(cw)} | PW:{x10(pw)} | "
-              f"P:C {ratio:.2f} | brecha {mp - us500:+.0f} pts")
+        if dia:
+            print(f"  [WEEKLY] 📌 Imán del día {dia['expiracion']} — "
+                  f"MaxPain:{dia['max_pain']} | brecha {dia['brecha']:+} pts")
+        if estr:
+            print(f"  [WEEKLY] 📊 Estructural {estr['expiracion']} — "
+                  f"MaxPain:{estr['max_pain']} | brecha {estr['brecha']:+} pts | "
+                  f"P:C {estr['ratio_pc']}")
     except Exception as e:
         print(f"  [WEEKLY] Error calculando: {e}")
+
 
 
 # ── Servidor HTTP ────────────────────────────────────────────
@@ -2359,26 +2451,32 @@ class _Handler(BaseHTTPRequestHandler):
         ruta = self.path.split("?")[0].rstrip("/")
         if ruta in ("", "/health"):
             self._json({"ok": True, "hora": hora_ny().strftime("%H:%M:%S ET")})
+        # ════════════════════════════════════════════════════════════════
+# RUTA /weekly DEL SERVIDOR — v2 (dos imanes)
+#
+# REEMPLAZA el bloque:
+#     elif ruta == "/weekly":
+#         ...hasta antes de...
+#     else:
+#         self._json({"ok": False, "error": "ruta no encontrada"}, 404)
+#
+# dentro de la clase _Handler, método do_GET.
+# ════════════════════════════════════════════════════════════════
+
         elif ruta == "/weekly":
             if not weekly_cache["disponible"]:
                 self._json({"ok": False, "error": "weekly aún no calculado"})
                 return
-            exp = weekly_cache["expiracion"]
+            estr = weekly_cache.get("estructural")
             self._json({
-                "ok": True,
-                "expiracion": exp,
-                "us500":      weekly_cache["us500"],
-                "max_pain":   weekly_cache["max_pain"],
-                "call_wall":  weekly_cache["call_wall"],
-                "put_wall":   weekly_cache["put_wall"],
-                "call_oi":    weekly_cache["call_oi"],
-                "put_oi":     weekly_cache["put_oi"],
-                "ratio_pc":   weekly_cache["ratio_pc"],
-                "top_calls":  weekly_cache["top_calls"],
-                "top_puts":   weekly_cache["top_puts"],
-                "brecha":     (weekly_cache["max_pain"] - weekly_cache["us500"])
-                              if weekly_cache["max_pain"] else None,
-                "trayectoria": weekly_cache["trayectoria"].get(exp, {}),
+                "ok":     True,
+                "us500":  weekly_cache["us500"],
+                # Imán del día: el que pinnea la próxima sesión (±3%)
+                "dia":    weekly_cache.get("dia"),
+                # Imán estructural: viernes / OPEX mensual (±10%)
+                "estructural": estr,
+                "trayectoria": (weekly_cache["trayectoria"].get(estr["expiracion"], {})
+                                if estr else {}),
             })
         else:
             self._json({"ok": False, "error": "ruta no encontrada"}, 404)
