@@ -5189,6 +5189,14 @@ while True:
                 # Persistir estado COT (acumulación del día)
                 guardar_estado_cot_github()
 
+# ── Weekly direccional — también con mercado cerrado ──
+            # El OI ya está publicado del cierre anterior, así que el
+            # fin de semana ya se puede ver la foto de la semana que
+            # arranca. No hace falta esperar a la apertura.
+            try:
+                calcular_weekly()
+            except Exception as e:
+                print(f"  [WEEKLY] Error (cerrado): {e}")            
             enviar_resumen_dominical()
             monitorear_overnight()
             # Pre-apertura — la ventana 8:45-9:29 ET cae con mercado CERRADO,
