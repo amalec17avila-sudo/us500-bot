@@ -1,15 +1,10 @@
 {
-  "oi_actual": 1091578,
-  "cambio_diario": -8545,
-  "cambio_semanal": -187881,
-  "fecha": "2026-08-25",
-  "ultima_actualizacion": "2026-08-25T23:44:38.665471",
+  "oi_actual": 1008405,
+  "cambio_diario": 5533,
+  "cambio_semanal": -271054,
+  "fecha": "2026-08-27",
+  "ultima_actualizacion": "2026-08-27T04:34:39.455950",
   "historial": [
-    {
-      "fecha": "2026-07-09",
-      "oi": 1261088,
-      "cambio": -3725
-    },
     {
       "fecha": "2026-07-10",
       "oi": 1506131,
@@ -154,6 +149,11 @@
       "fecha": "2026-08-25",
       "oi": 1091578,
       "cambio": -8545
+    },
+    {
+      "fecha": "2026-08-27",
+      "oi": 1008405,
+      "cambio": 5533
     }
   ]
 }
