@@ -5585,7 +5585,11 @@ while True:
             print(f"  [SQUEEZE] Error loop: {e}")
 
         # ── Options Sweep Detection cada 5 minutos ────────────
-        if TRADIER_TOKEN and contador_ciclos % 5 == 0:
+                # Sweeps cada 1 min (antes 5). Tradier permite 120 req/min y
+        # el bot usa ~10, así que hay margen de sobra. La resolución
+        # fina es lo que permite medir si el flujo sale ANTES o DESPUÉS
+        # del movimiento del precio — con 5 min esa secuencia no se veía.
+        if TRADIER_TOKEN:
             sweep = detectar_options_sweep()
             if sweep:
                 hoy = ahora_ny.date()
@@ -5605,7 +5609,7 @@ while True:
                 hist = sweep_cache.get("historial_balance", [])
                 if not hist or hist[-1] != balance_actual:
                     hist.append(balance_actual)
-                    if len(hist) > 8:   # mantener las últimas 8 lecturas
+                    if len(hist) > 20:   # ~20 min de historia con lecturas de 1 min
                         hist.pop(0)
                     sweep_cache["historial_balance"] = hist
 
