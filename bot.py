@@ -3411,6 +3411,226 @@ def cmd_stats(message):
         bot.reply_to(message, "\n".join(lineas), parse_mode="Markdown")
     except Exception as e:
         bot.reply_to(message, f"Error: {e}")
+# ════════════════════════════════════════════════════════════════
+# UMBRALES ADAPTATIVOS — la vara se mueve con el mercado
+#
+# EL PROBLEMA QUE RESUELVE
+#   Todos los umbrales del bot eran constantes fijas calibradas una
+#   vez en julio. Pero el mercado cambia de escala:
+#
+#     p90 del |balance|:   jul $526M · ago $379M · sep $399M
+#     rango diario medio:  jul  63pt · ago  43pt · sep  41pt
+#
+#   Con un umbral fijo de $500M, "DOMINANTE" significaba algo
+#   distinto cada mes. Y el umbral de colapso ($300M) estaba en el
+#   percentil 99.8 — o sea, casi nunca se disparaba.
+#
+# CÓMO FUNCIONA
+#   En vez de constantes, los umbrales son PERCENTILES de los
+#   últimos N días. Se recalculan solos al cierre de cada jornada.
+#   Si el mercado se calma, la vara baja; si se agita, sube.
+#
+#   Los percentiles objetivo (p90, p97, p40) SÍ son elegidos a mano,
+#   pero eso es una decisión de diseño explícita ("quiero que
+#   dominante sea el 10% más extremo"), no un número heredado de
+#   una calibración vieja.
+#
+# DÓNDE PEGARLO
+#   Justo ANTES de:   def _regimen_gamma(vix_nivel=None):
+# ════════════════════════════════════════════════════════════════
+
+VENTANA_CALIBRACION = 20      # días hábiles de historia para los percentiles
+MIN_DIAS_CALIBRAR   = 5       # con menos días, se usan los valores de arranque
+
+umbrales = {
+    # Valores de ARRANQUE (los viejos, mientras no haya historia).
+    # Se reemplazan solos en cuanto haya MIN_DIAS_CALIBRAR días.
+    "dominante":   500_000_000,   # |balance| que marca convicción extrema
+    "ruido":        80_000_000,   # bajo esto, el balance es absorbible
+    "flujo_plano":  20_000_000,   # |derivada| por debajo = nadie empuja
+    "colapso":     300_000_000,   # salida brusca del lado dominante
+    "rango_pts":            20,   # ancho del rango para silenciar señales
+    # Metadatos
+    "calibrado":         False,
+    "dias_muestra":          0,
+    "fecha_calibracion":  None,
+}
+
+# Historia diaria para calibrar: una entrada por jornada
+historia_calibracion = {
+    "dias": [],     # [{fecha, balances:[], derivadas:[], rango}]
+    "sha":  None,
+}
+
+CALIBRACION_URL = ("https://api.github.com/repos/amalec17avila-sudo/"
+                   "us500-bot/contents/data/calibracion.json")
+
+
+def _pct(valores, p):
+    """Percentil sin depender de numpy sobre listas vacías."""
+    if not valores:
+        return None
+    v = sorted(valores)
+    k = (len(v) - 1) * p / 100.0
+    lo, hi = int(k), min(int(k) + 1, len(v) - 1)
+    return v[lo] + (v[hi] - v[lo]) * (k - lo)
+
+
+def acumular_dia_calibracion(ahora_ny):
+    """
+    Al cierre, resume la jornada y la agrega a la historia.
+    Guarda los |balance| y |derivada| del día más el rango recorrido.
+    """
+    try:
+        hist = trades_cache.get("lecturas_hoy", [])
+        if len(hist) < 30:
+            return                      # día incompleto, no sirve para calibrar
+
+        balances  = [abs(r["balance"]) for r in hist if r.get("balance") is not None]
+        derivadas = [abs(r["dBal"])    for r in hist if r.get("dBal")    is not None]
+        precios   = [r["precio"] for r in hist if r.get("precio")]
+        rango     = (max(precios) - min(precios)) if len(precios) > 2 else None
+
+        fecha = ahora_ny.strftime("%Y-%m-%d")
+        dias = historia_calibracion["dias"]
+        if any(d["fecha"] == fecha for d in dias):
+            return                      # ya estaba
+
+        dias.append({"fecha": fecha, "balances": balances,
+                     "derivadas": derivadas, "rango": rango})
+        historia_calibracion["dias"] = dias[-VENTANA_CALIBRACION:]
+        print(f"  [CALIB] 📅 Día {fecha} acumulado — "
+              f"{len(balances)} lecturas, rango {rango:.0f} pts"
+              if rango else f"  [CALIB] 📅 Día {fecha} acumulado")
+        recalibrar_umbrales()
+        guardar_calibracion_github()
+    except Exception as e:
+        print(f"  [CALIB] Error acumulando: {e}")
+
+
+def recalibrar_umbrales():
+    """
+    Recalcula los umbrales como percentiles de los últimos días.
+
+    Los percentiles se eligieron por FRECUENCIA DESEADA, medida sobre
+    los días reales con resolución de 1 minuto (~390 lecturas/día):
+
+      dominante   = p93 del |balance|    → ~7% de lecturas
+      ruido       = p40 del |balance|    → lo absorbible
+      flujo_plano = p50 de la |derivada| → la mitad marcada plana
+      colapso     = p99.8 de la |derivada| → ~1 alerta al día
+
+    Ojo con el colapso: a p97 daban 12 alertas diarias — con 390
+    lecturas por día, un percentil que suena exigente no lo es.
+    Una alerta que salta doce veces al día no es una alerta.
+    """
+    dias = historia_calibracion["dias"]
+    if len(dias) < MIN_DIAS_CALIBRAR:
+        print(f"  [CALIB] Solo {len(dias)} días — se mantienen los valores de arranque")
+        return
+
+    bal = [b for d in dias for b in d.get("balances", [])]
+    der = [x for d in dias for x in d.get("derivadas", [])]
+    rgs = [d["rango"] for d in dias if d.get("rango")]
+
+    nuevo = {}
+    if bal:
+        nuevo["dominante"] = _pct(bal, 93)
+        nuevo["ruido"]     = _pct(bal, 40)
+    if der:
+        nuevo["flujo_plano"] = _pct(der, 50)
+        nuevo["colapso"]     = _pct(der, 99.8)
+    if rgs:
+        nuevo["rango_pts"] = (sum(rgs) / len(rgs)) * 0.40
+
+    # Suelos de sanidad: evitan que un tramo anómalo deje umbrales absurdos
+    if nuevo.get("dominante"):   nuevo["dominante"]   = max(nuevo["dominante"], 100e6)
+    if nuevo.get("flujo_plano"): nuevo["flujo_plano"] = max(nuevo["flujo_plano"], 3e6)
+    if nuevo.get("colapso"):     nuevo["colapso"]     = max(nuevo["colapso"], 30e6)
+    if nuevo.get("rango_pts"):   nuevo["rango_pts"]   = max(nuevo["rango_pts"], 8)
+
+    antes = dict(umbrales)
+    umbrales.update(nuevo)
+    umbrales.update({"calibrado": True, "dias_muestra": len(dias),
+                     "fecha_calibracion": hora_ny().strftime("%Y-%m-%d")})
+
+    print(f"  [CALIB] ✅ Umbrales recalibrados con {len(dias)} días:")
+    print(f"     dominante:   ${antes['dominante']/1e6:>6,.0f}M → ${umbrales['dominante']/1e6:>6,.0f}M")
+    print(f"     ruido:       ${antes['ruido']/1e6:>6,.0f}M → ${umbrales['ruido']/1e6:>6,.0f}M")
+    print(f"     flujo plano: ${antes['flujo_plano']/1e6:>6,.1f}M → ${umbrales['flujo_plano']/1e6:>6,.1f}M")
+    print(f"     colapso:     ${antes['colapso']/1e6:>6,.0f}M → ${umbrales['colapso']/1e6:>6,.0f}M")
+    print(f"     rango:       {antes['rango_pts']:>6.0f}pt → {umbrales['rango_pts']:>6.0f}pt")
+
+
+def cargar_calibracion_github():
+    """Restaura la historia de calibración al arrancar."""
+    try:
+        import base64
+        req = urllib.request.Request(CALIBRACION_URL, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api = json.loads(resp.read().decode())
+        historia_calibracion["sha"] = api.get("sha")
+        datos = json.loads(base64.b64decode(api.get("content", "")).decode("utf-8"))
+        historia_calibracion["dias"] = datos.get("dias", [])[-VENTANA_CALIBRACION:]
+        print(f"  [CALIB] ✅ Historia restaurada — {len(historia_calibracion['dias'])} días")
+        recalibrar_umbrales()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("  [CALIB] 📊 Sin historia — se usará arranque hasta juntar "
+                  f"{MIN_DIAS_CALIBRAR} días")
+        else:
+            print(f"  [CALIB] Error cargando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [CALIB] Error cargando: {e}")
+
+
+def guardar_calibracion_github():
+    """Persiste la historia de calibración."""
+    if not GH_TOKEN:
+        return
+    try:
+        import base64
+        cuerpo = {"dias": historia_calibracion["dias"],
+                  "umbrales": {k: v for k, v in umbrales.items()},
+                  "guardado": hora_ny().strftime("%Y-%m-%d %H:%M ET")}
+        b64 = base64.b64encode(
+            json.dumps(cuerpo, ensure_ascii=False, default=str).encode("utf-8")).decode("ascii")
+        body = {"message": f"Calibración {hora_ny().strftime('%Y-%m-%d')}", "content": b64}
+        if historia_calibracion["sha"]:
+            body["sha"] = historia_calibracion["sha"]
+        req = urllib.request.Request(
+            CALIBRACION_URL, data=json.dumps(body).encode("utf-8"),
+            headers={**_gh_headers(), "Content-Type": "application/json"},
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            api = json.loads(resp.read().decode())
+        historia_calibracion["sha"] = api.get("content", {}).get("sha")
+        print("  [CALIB] 💾 Calibración guardada")
+    except Exception as e:
+        print(f"  [CALIB] Error guardando: {e}")
+
+
+@bot.message_handler(commands=["umbrales"])
+def cmd_umbrales(message):
+    """Muestra los umbrales vigentes y con cuántos días se calibraron."""
+    try:
+        estado = (f"calibrado con {umbrales['dias_muestra']} días "
+                  f"({umbrales['fecha_calibracion']})") if umbrales["calibrado"] \
+                 else "valores de arranque (sin calibrar todavía)"
+        bot.reply_to(message,
+            f"⚖️ *UMBRALES VIGENTES*\n"
+            f"_{estado}_\n"
+            f"────────────────────────────\n"
+            f"Dominante:   `${umbrales['dominante']/1e6:,.0f}M`\n"
+            f"Ruido:       `${umbrales['ruido']/1e6:,.0f}M`\n"
+            f"Flujo plano: `${umbrales['flujo_plano']/1e6:,.1f}M`\n"
+            f"Colapso:     `${umbrales['colapso']/1e6:,.0f}M`\n"
+            f"Rango:       `{umbrales['rango_pts']:.0f}` pts\n"
+            f"────────────────────────────\n"
+            f"Se recalculan solos al cierre de cada día.",
+            parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
     
 def _regimen_gamma(vix_nivel=None):
     """
