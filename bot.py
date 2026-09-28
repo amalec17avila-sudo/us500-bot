@@ -2493,6 +2493,924 @@ def iniciar_servidor_http():
         srv.serve_forever()
     except Exception as e:
         print(f"  [HTTP] Error: {e}")
+# ════════════════════════════════════════════════════════════════
+# REGISTRO DE TRADES — cierra el circuito con el P&L real
+#
+# POR QUÉ EXISTE
+#   El journal de señales mide los pronósticos DEL BOT. Este módulo
+#   mide los trades DEL OPERADOR. Sin esto no se puede responder
+#   "¿mi edge mejora?" con un número.
+#
+# QUÉ GUARDA
+#   - Trades tomados: entrada, salida, dirección, contratos, P&L
+#   - Trades NO tomados: setups vistos y dejados pasar (/paso)
+#   - El CONTEXTO del momento de entrada, no del cierre: se busca en
+#     el historial del día la lectura más cercana a esa hora y de ahí
+#     salen régimen, niveles, balance y derivada. Sin eso el registro
+#     tendría P&L sin el "por qué".
+#
+# FLUJO DIARIO
+#   Al cerrar el mercado el bot pregunta si hubo trades. Si respondés
+#   que no, cierra la sesión. Si respondés que sí, pide los datos de
+#   cada uno en una conversación corta.
+#
+# DÓNDE PEGARLO
+#   Justo ANTES de:   def _regimen_gamma(vix_nivel=None):
+# ════════════════════════════════════════════════════════════════
+
+TRADES_URL = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/trades.json"
+
+trades_cache = {
+    "trades":     [],     # histórico completo
+    "sha":        None,
+    "dirty":      False,
+    # Historial de lecturas del día EN MEMORIA, para el snapshot por hora.
+    # Cada entrada: {hora_hn, ts, precio, balance, dBal, flip, call_wall,
+    #                put_wall, gex0_neto, regimen}
+    "lecturas_hoy": [],
+    "dia_lecturas": None,
+}
+
+# Estado de la conversación de cierre (máquina de estados simple)
+dialogo_cierre = {
+    "activo":     False,
+    "paso":       None,   # que_pregunto / direccion / entrada / salida / ...
+    "dia":        None,
+    "borrador":   {},
+    "preguntado": None,   # fecha en que ya se preguntó, para no repetir
+}
+
+
+def registrar_lectura_contexto(ahora_ny, precio, sweep, balance_actual):
+    """
+    Guarda en memoria una foto del mercado en esta lectura.
+    Se llama en cada ciclo de sweeps. Es lo que permite reconstruir
+    después las condiciones EXACTAS de la hora en que se entró.
+    """
+    try:
+        hoy = ahora_ny.date()
+        if trades_cache["dia_lecturas"] != hoy:
+            trades_cache["lecturas_hoy"] = []
+            trades_cache["dia_lecturas"] = hoy
+
+        hist = trades_cache["lecturas_hoy"]
+        dbal = None
+        if hist:
+            dbal = balance_actual - hist[-1]["balance"]
+
+        hora_hn = ahora_ny.astimezone(pytz.timezone("America/Tegucigalpa"))
+        neto0 = gex_0dte_cache.get("neto") if gex_0dte_cache.get("disponible") else None
+
+        hist.append({
+            "hora_hn":   hora_hn.strftime("%H:%M"),
+            "ts":        time.time(),
+            "precio":    round(float(precio), 2) if precio else None,
+            "balance":   round(float(balance_actual), 2),
+            "dBal":      round(float(dbal), 2) if dbal is not None else None,
+            "flip":      gex_niveles.get("gamma_flip"),
+            "call_wall": gex_niveles.get("call_wall"),
+            "put_wall":  gex_niveles.get("put_wall"),
+            "gex0_neto": round(float(neto0), 0) if neto0 is not None else None,
+            "regimen":   ("POSITIVA" if neto0 is not None and neto0 >= 0
+                          else ("NEGATIVA" if neto0 is not None else None)),
+        })
+        # Un día son ~390 lecturas; con 500 hay margen de sobra
+        if len(hist) > 500:
+            trades_cache["lecturas_hoy"] = hist[-500:]
+    except Exception as e:
+        print(f"  [TRADES] Error guardando contexto: {e}")
+
+
+def _snapshot_por_hora(hhmm):
+    """
+    Busca la lectura del día más cercana a una hora "HH:MM" (hora HN).
+    Devuelve el contexto de ESE momento, no del cierre.
+    """
+    hist = trades_cache.get("lecturas_hoy", [])
+    if not hist:
+        return None
+    try:
+        h, m = hhmm.split(":")
+        objetivo = int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+    mejor, dist_min = None, 9999
+    for r in hist:
+        try:
+            hh, mm = r["hora_hn"].split(":")
+            d = abs(int(hh) * 60 + int(mm) - objetivo)
+            if d < dist_min:
+                dist_min, mejor = d, r
+        except Exception:
+            continue
+    # Si la lectura más cercana está a más de 10 min, el contexto no sirve
+    if mejor and dist_min <= 10:
+        return {**mejor, "desfase_min": dist_min}
+    return None
+
+
+def cargar_trades_github():
+    """Carga el histórico de trades al arrancar el bot."""
+    try:
+        import base64
+        req = urllib.request.Request(TRADES_URL, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api = json.loads(resp.read().decode())
+        trades_cache["sha"] = api.get("sha")
+        datos = json.loads(base64.b64decode(api.get("content", "")).decode("utf-8"))
+        trades_cache["trades"] = datos.get("trades", [])
+        tomados = sum(1 for t in trades_cache["trades"] if t.get("tipo") == "trade")
+        pasos   = sum(1 for t in trades_cache["trades"] if t.get("tipo") == "paso")
+        print(f"  [TRADES] ✅ Cargados — {tomados} trades, {pasos} no tomados")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("  [TRADES] 📊 Sin histórico previo — se creará con el primer registro")
+        else:
+            print(f"  [TRADES] Error cargando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [TRADES] Error cargando: {e}")
+
+
+def guardar_trades_github():
+    """Persiste el histórico en GitHub."""
+    if not GH_TOKEN or not trades_cache["dirty"]:
+        return
+    try:
+        import base64
+        cuerpo = {"trades": trades_cache["trades"],
+                  "guardado": hora_ny().strftime("%Y-%m-%d %H:%M ET")}
+        b64 = base64.b64encode(
+            json.dumps(cuerpo, ensure_ascii=False, default=str).encode("utf-8")).decode("ascii")
+        body = {"message": f"Trades {hora_ny().strftime('%Y-%m-%d %H:%M')}", "content": b64}
+        if trades_cache["sha"]:
+            body["sha"] = trades_cache["sha"]
+        req = urllib.request.Request(
+            TRADES_URL, data=json.dumps(body).encode("utf-8"),
+            headers={**_gh_headers(), "Content-Type": "application/json"},
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            api = json.loads(resp.read().decode())
+        trades_cache["sha"] = api.get("content", {}).get("sha")
+        trades_cache["dirty"] = False
+        print(f"  [TRADES] 💾 Guardados — {len(trades_cache['trades'])} registros")
+    except Exception as e:
+        print(f"  [TRADES] Error guardando: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# COMANDO /paso — setup visto y NO tomado, anotado EN EL MOMENTO
+# ════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=["paso"])
+def cmd_paso(message):
+    """
+    Uso:  /paso long 7750 no habia confluencia
+          /paso short 7700 dude del nivel
+    Se registra con el contexto del momento (ahora), que es cuando
+    realmente se vio el setup. Es la mitad del aprendizaje: sin los
+    no tomados solo se mide lo que se hizo, no lo que se debió hacer.
+    """
+    try:
+        partes = message.text.split(maxsplit=3)
+        if len(partes) < 3:
+            bot.reply_to(message,
+                "Uso: /paso <long|short> <precio> <motivo>\n"
+                "Ej: /paso long 7750 no habia confluencia")
+            return
+        direccion = partes[1].lower()
+        if direccion not in ("long", "short"):
+            bot.reply_to(message, "La dirección debe ser long o short."); return
+        precio = float(partes[2])
+        motivo = partes[3] if len(partes) > 3 else ""
+
+        ahora = hora_ny()
+        hora_hn = ahora.astimezone(pytz.timezone("America/Tegucigalpa")).strftime("%H:%M")
+        ctx = _snapshot_por_hora(hora_hn)
+
+        trades_cache["trades"].append({
+            "tipo":      "paso",
+            "fecha":     ahora.strftime("%Y-%m-%d"),
+            "hora_hn":   hora_hn,
+            "direccion": direccion,
+            "precio":    precio,
+            "motivo":    motivo,
+            "contexto":  ctx,
+        })
+        trades_cache["dirty"] = True
+        guardar_trades_github()
+
+        reg = ctx.get("regimen") if ctx else None
+        bot.reply_to(message,
+            f"📝 Setup NO tomado registrado\n"
+            f"{direccion.upper()} @ {precio} · {hora_hn} HN\n"
+            f"Régimen: {reg or 'N/D'}\n"
+            f"Motivo: {motivo or '—'}")
+        print(f"  [TRADES] 📝 Paso registrado — {direccion} @ {precio}")
+    except ValueError:
+        bot.reply_to(message, "El precio debe ser un número. Ej: /paso long 7750 sin confluencia")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# DIÁLOGO DE CIERRE — pregunta al terminar la sesión
+# ════════════════════════════════════════════════════════════════
+def iniciar_dialogo_cierre():
+    """Al cerrar el mercado, preguntar si hubo trades."""
+    ahora = hora_ny()
+    if dialogo_cierre["preguntado"] == ahora.date():
+        return
+    if not es_dia_habil(ahora.date()):
+        return
+    dialogo_cierre.update({
+        "activo": True, "paso": "hubo_trades", "dia": ahora.date(),
+        "borrador": {}, "preguntado": ahora.date(),
+    })
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID,
+            "📓 *CIERRE DE SESIÓN*\n"
+            "────────────────────────────\n"
+            "¿Operaste hoy?\n\n"
+            "Respondé *si* o *no*.",
+            parse_mode="Markdown")
+        print("  [TRADES] 📓 Diálogo de cierre iniciado")
+    except Exception as e:
+        print(f"  [TRADES] Error iniciando diálogo: {e}")
+
+
+def _pl_puntos(direccion, entrada, salida):
+    return (salida - entrada) if direccion == "long" else (entrada - salida)
+
+
+@bot.message_handler(
+    func=lambda m: dialogo_cierre["activo"]
+                   and not (m.text or "").startswith("/"))
+def manejar_dialogo_cierre(message):
+    """
+    Máquina de estados del registro. Solo activa tras el cierre.
+    Excluye los mensajes que empiezan con "/" para que los comandos
+    (/paso, /stats, /long, /cerrar...) sigan funcionando aunque el
+    diálogo esté abierto. Para abortar: escribir "cancelar".
+    """
+    txt = (message.text or "").strip()
+    paso = dialogo_cierre["paso"]
+    b = dialogo_cierre["borrador"]
+
+    # Escape manual en cualquier momento
+    if txt.lower() in ("cancelar", "/cancelar", "salir"):
+        dialogo_cierre.update({"activo": False, "paso": None, "borrador": {}})
+        bot.reply_to(message, "Registro cancelado."); return
+
+    try:
+        if paso == "hubo_trades":
+            if txt.lower().startswith("n"):
+                dialogo_cierre.update({"activo": False, "paso": None})
+                pasos_hoy = sum(1 for t in trades_cache["trades"]
+                                if t.get("tipo") == "paso"
+                                and t.get("fecha") == hora_ny().strftime("%Y-%m-%d"))
+                extra = f"\nSetups no tomados registrados hoy: {pasos_hoy}" if pasos_hoy else ""
+                bot.reply_to(message, f"✅ Sesión cerrada sin trades.{extra}")
+                return
+            if txt.lower().startswith("s"):
+                dialogo_cierre["paso"] = "direccion"
+                bot.reply_to(message, "¿Dirección? *long* o *short*", parse_mode="Markdown")
+                return
+            bot.reply_to(message, "Respondé *si* o *no*.", parse_mode="Markdown"); return
+
+        if paso == "direccion":
+            d = txt.lower()
+            if d not in ("long", "short"):
+                bot.reply_to(message, "Escribí *long* o *short*.", parse_mode="Markdown"); return
+            b["direccion"] = d
+            dialogo_cierre["paso"] = "hora_entrada"
+            bot.reply_to(message, "¿Hora de ENTRADA? (HH:MM hora HN)\nEj: `08:14`",
+                         parse_mode="Markdown"); return
+
+        if paso == "hora_entrada":
+            if ":" not in txt:
+                bot.reply_to(message, "Formato HH:MM. Ej: 08:14"); return
+            b["hora_entrada"] = txt
+            dialogo_cierre["paso"] = "precio_entrada"
+            bot.reply_to(message, "¿Precio de ENTRADA?"); return
+
+        if paso == "precio_entrada":
+            b["entrada"] = float(txt.replace(",", "."))
+            dialogo_cierre["paso"] = "hora_salida"
+            bot.reply_to(message, "¿Hora de SALIDA? (HH:MM)"); return
+
+        if paso == "hora_salida":
+            if ":" not in txt:
+                bot.reply_to(message, "Formato HH:MM. Ej: 09:29"); return
+            b["hora_salida"] = txt
+            dialogo_cierre["paso"] = "precio_salida"
+            bot.reply_to(message, "¿Precio de SALIDA?"); return
+
+        if paso == "precio_salida":
+            b["salida"] = float(txt.replace(",", "."))
+            dialogo_cierre["paso"] = "contratos"
+            bot.reply_to(message, "¿Cuántos contratos? Ej: `0.2`", parse_mode="Markdown"); return
+
+        if paso == "contratos":
+            b["contratos"] = float(txt.replace(",", "."))
+            dialogo_cierre["paso"] = "motivo"
+            bot.reply_to(message,
+                "¿Por qué entraste? (una línea)\n"
+                "Ej: `flip abajo como imán, sweeps acelerando`",
+                parse_mode="Markdown"); return
+
+        if paso == "motivo":
+            b["motivo"] = txt
+            # ── Guardar con el contexto de la HORA DE ENTRADA ──
+            ahora = hora_ny()
+            ctx = _snapshot_por_hora(b["hora_entrada"])
+            pl_pts = _pl_puntos(b["direccion"], b["entrada"], b["salida"])
+            registro = {
+                "tipo":        "trade",
+                "fecha":       ahora.strftime("%Y-%m-%d"),
+                "direccion":   b["direccion"],
+                "hora_entrada": b["hora_entrada"],
+                "entrada":     b["entrada"],
+                "hora_salida": b["hora_salida"],
+                "salida":      b["salida"],
+                "contratos":   b["contratos"],
+                "pl_puntos":   round(pl_pts, 2),
+                "motivo":      b["motivo"],
+                "contexto":    ctx,     # régimen, niveles y flujo de ESA hora
+            }
+            trades_cache["trades"].append(registro)
+            trades_cache["dirty"] = True
+            guardar_trades_github()
+
+            emoji = "✅" if pl_pts > 0 else ("➖" if pl_pts == 0 else "❌")
+            if ctx:
+                ctx_txt = (f"\n📊 Contexto {b['hora_entrada']}:"
+                           f"\n   Régimen: `{ctx.get('regimen') or 'N/D'}`"
+                           f"\n   Flip:`{ctx.get('flip')}` Call:`{ctx.get('call_wall')}` "
+                           f"Put:`{ctx.get('put_wall')}`"
+                           f"\n   Balance: `${(ctx.get('balance') or 0)/1e6:,.0f}M`"
+                           f" · Δ `${(ctx.get('dBal') or 0)/1e6:+,.0f}M`")
+            else:
+                ctx_txt = "\n⚠️ Sin contexto para esa hora (fuera del horario registrado)"
+
+            bot.reply_to(message,
+                f"{emoji} *Trade registrado*\n"
+                f"{b['direccion'].upper()} {b['entrada']} → {b['salida']}\n"
+                f"Resultado: `{pl_pts:+.1f}` pts · {b['contratos']} contratos"
+                f"{ctx_txt}\n\n"
+                f"¿Otro trade? *si* / *no*",
+                parse_mode="Markdown")
+            dialogo_cierre["paso"] = "otro"
+            dialogo_cierre["borrador"] = {}
+            return
+
+        if paso == "otro":
+            if txt.lower().startswith("s"):
+                dialogo_cierre["paso"] = "direccion"
+                bot.reply_to(message, "¿Dirección? *long* o *short*", parse_mode="Markdown")
+                return
+            dialogo_cierre.update({"activo": False, "paso": None})
+            hoy = hora_ny().strftime("%Y-%m-%d")
+            dia = [t for t in trades_cache["trades"]
+                   if t.get("fecha") == hoy and t.get("tipo") == "trade"]
+            neto = sum(t.get("pl_puntos", 0) for t in dia)
+            bot.reply_to(message,
+                f"✅ *Sesión cerrada*\n"
+                f"{len(dia)} trade(s) · neto `{neto:+.1f}` pts",
+                parse_mode="Markdown")
+            return
+
+    except ValueError:
+        bot.reply_to(message, "Eso no es un número válido. Probá de nuevo.")
+    except Exception as e:
+        dialogo_cierre.update({"activo": False, "paso": None, "borrador": {}})
+        bot.reply_to(message, f"Error, registro cancelado: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# COMANDO /stats — resumen del registro
+# ════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    """Resumen de los trades registrados, cortado por hora y régimen."""
+    try:
+        ts = [t for t in trades_cache["trades"] if t.get("tipo") == "trade"]
+        if not ts:
+            bot.reply_to(message, "Todavía no hay trades registrados."); return
+
+        n = len(ts)
+        wins = [t for t in ts if t.get("pl_puntos", 0) > 0]
+        neto = sum(t.get("pl_puntos", 0) for t in ts)
+        prom_w = (sum(t["pl_puntos"] for t in wins)/len(wins)) if wins else 0
+        perd = [t for t in ts if t.get("pl_puntos", 0) < 0]
+        prom_p = (sum(t["pl_puntos"] for t in perd)/len(perd)) if perd else 0
+
+        lineas = [f"📓 *REGISTRO DE TRADES*",
+                  f"{'─'*28}",
+                  f"Total: `{n}` · Win rate: `{len(wins)/n*100:.0f}%`",
+                  f"Neto: `{neto:+.1f}` pts",
+                  f"Ganador medio: `{prom_w:+.1f}` · Perdedor medio: `{prom_p:+.1f}`"]
+
+        # Por franja horaria — mide si la ventana de la mañana rinde más
+        def franja(t):
+            try:
+                h = int(t.get("hora_entrada","00:00").split(":")[0])
+                return "mañana (7-10)" if h < 10 else "tarde (10+)"
+            except Exception:
+                return "s/d"
+        porf = {}
+        for t in ts:
+            porf.setdefault(franja(t), []).append(t.get("pl_puntos", 0))
+        if len(porf) > 1:
+            lineas.append(f"{'─'*28}\n*Por franja:*")
+            for f, v in porf.items():
+                w = sum(1 for x in v if x > 0)
+                lineas.append(f"  {f}: n=`{len(v)}` · {w/len(v)*100:.0f}% · "
+                              f"neto `{sum(v):+.1f}` pts")
+
+        # Por régimen de gamma
+        porr = {}
+        for t in ts:
+            c = t.get("contexto") or {}
+            r = c.get("regimen")
+            if r: porr.setdefault(r, []).append(t.get("pl_puntos", 0))
+        if porr:
+            lineas.append(f"{'─'*28}\n*Por régimen:*")
+            for r, v in porr.items():
+                w = sum(1 for x in v if x > 0)
+                lineas.append(f"  gamma {r.lower()}: n=`{len(v)}` · {w/len(v)*100:.0f}% · "
+                              f"neto `{sum(v):+.1f}` pts")
+
+        pasos = [t for t in trades_cache["trades"] if t.get("tipo") == "paso"]
+        if pasos:
+            lineas.append(f"{'─'*28}\nSetups no tomados: `{len(pasos)}`")
+
+        # Con pocos trades cualquier porcentaje es ruido — decirlo explícito
+        if n < 30:
+            lineas.append(f"\n_Muestra chica (n={n}); los porcentajes todavía no son "
+                          f"conclusiones._")
+
+        bot.reply_to(message, "\n".join(lineas), parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+# ════════════════════════════════════════════════════════════════
+# REGISTRO DE TRADES — cierra el circuito con el P&L real
+#
+# POR QUÉ EXISTE
+#   El journal de señales mide los pronósticos DEL BOT. Este módulo
+#   mide los trades DEL OPERADOR. Sin esto no se puede responder
+#   "¿mi edge mejora?" con un número.
+#
+# QUÉ GUARDA
+#   - Trades tomados: entrada, salida, dirección, contratos, P&L
+#   - Trades NO tomados: setups vistos y dejados pasar (/paso)
+#   - El CONTEXTO del momento de entrada, no del cierre: se busca en
+#     el historial del día la lectura más cercana a esa hora y de ahí
+#     salen régimen, niveles, balance y derivada. Sin eso el registro
+#     tendría P&L sin el "por qué".
+#
+# FLUJO DIARIO
+#   Al cerrar el mercado el bot pregunta si hubo trades. Si respondés
+#   que no, cierra la sesión. Si respondés que sí, pide los datos de
+#   cada uno en una conversación corta.
+#
+# DÓNDE PEGARLO
+#   Justo ANTES de:   def _regimen_gamma(vix_nivel=None):
+# ════════════════════════════════════════════════════════════════
+
+TRADES_URL = "https://api.github.com/repos/amalec17avila-sudo/us500-bot/contents/data/trades.json"
+
+trades_cache = {
+    "trades":     [],     # histórico completo
+    "sha":        None,
+    "dirty":      False,
+    # Historial de lecturas del día EN MEMORIA, para el snapshot por hora.
+    # Cada entrada: {hora_hn, ts, precio, balance, dBal, flip, call_wall,
+    #                put_wall, gex0_neto, regimen}
+    "lecturas_hoy": [],
+    "dia_lecturas": None,
+}
+
+# Estado de la conversación de cierre (máquina de estados simple)
+dialogo_cierre = {
+    "activo":     False,
+    "paso":       None,   # que_pregunto / direccion / entrada / salida / ...
+    "dia":        None,
+    "borrador":   {},
+    "preguntado": None,   # fecha en que ya se preguntó, para no repetir
+}
+
+
+def registrar_lectura_contexto(ahora_ny, precio, sweep, balance_actual):
+    """
+    Guarda en memoria una foto del mercado en esta lectura.
+    Se llama en cada ciclo de sweeps. Es lo que permite reconstruir
+    después las condiciones EXACTAS de la hora en que se entró.
+    """
+    try:
+        hoy = ahora_ny.date()
+        if trades_cache["dia_lecturas"] != hoy:
+            trades_cache["lecturas_hoy"] = []
+            trades_cache["dia_lecturas"] = hoy
+
+        hist = trades_cache["lecturas_hoy"]
+        dbal = None
+        if hist:
+            dbal = balance_actual - hist[-1]["balance"]
+
+        hora_hn = ahora_ny.astimezone(pytz.timezone("America/Tegucigalpa"))
+        neto0 = gex_0dte_cache.get("neto") if gex_0dte_cache.get("disponible") else None
+
+        hist.append({
+            "hora_hn":   hora_hn.strftime("%H:%M"),
+            "ts":        time.time(),
+            "precio":    round(float(precio), 2) if precio else None,
+            "balance":   round(float(balance_actual), 2),
+            "dBal":      round(float(dbal), 2) if dbal is not None else None,
+            "flip":      gex_niveles.get("gamma_flip"),
+            "call_wall": gex_niveles.get("call_wall"),
+            "put_wall":  gex_niveles.get("put_wall"),
+            "gex0_neto": round(float(neto0), 0) if neto0 is not None else None,
+            "regimen":   ("POSITIVA" if neto0 is not None and neto0 >= 0
+                          else ("NEGATIVA" if neto0 is not None else None)),
+        })
+        # Un día son ~390 lecturas; con 500 hay margen de sobra
+        if len(hist) > 500:
+            trades_cache["lecturas_hoy"] = hist[-500:]
+    except Exception as e:
+        print(f"  [TRADES] Error guardando contexto: {e}")
+
+
+def _snapshot_por_hora(hhmm):
+    """
+    Busca la lectura del día más cercana a una hora "HH:MM" (hora HN).
+    Devuelve el contexto de ESE momento, no del cierre.
+    """
+    hist = trades_cache.get("lecturas_hoy", [])
+    if not hist:
+        return None
+    try:
+        h, m = hhmm.split(":")
+        objetivo = int(h) * 60 + int(m)
+    except Exception:
+        return None
+
+    mejor, dist_min = None, 9999
+    for r in hist:
+        try:
+            hh, mm = r["hora_hn"].split(":")
+            d = abs(int(hh) * 60 + int(mm) - objetivo)
+            if d < dist_min:
+                dist_min, mejor = d, r
+        except Exception:
+            continue
+    # Si la lectura más cercana está a más de 10 min, el contexto no sirve
+    if mejor and dist_min <= 10:
+        return {**mejor, "desfase_min": dist_min}
+    return None
+
+
+def cargar_trades_github():
+    """Carga el histórico de trades al arrancar el bot."""
+    try:
+        import base64
+        req = urllib.request.Request(TRADES_URL, headers=_gh_headers())
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            api = json.loads(resp.read().decode())
+        trades_cache["sha"] = api.get("sha")
+        datos = json.loads(base64.b64decode(api.get("content", "")).decode("utf-8"))
+        trades_cache["trades"] = datos.get("trades", [])
+        tomados = sum(1 for t in trades_cache["trades"] if t.get("tipo") == "trade")
+        pasos   = sum(1 for t in trades_cache["trades"] if t.get("tipo") == "paso")
+        print(f"  [TRADES] ✅ Cargados — {tomados} trades, {pasos} no tomados")
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            print("  [TRADES] 📊 Sin histórico previo — se creará con el primer registro")
+        else:
+            print(f"  [TRADES] Error cargando: HTTP {e.code}")
+    except Exception as e:
+        print(f"  [TRADES] Error cargando: {e}")
+
+
+def guardar_trades_github():
+    """Persiste el histórico en GitHub."""
+    if not GH_TOKEN or not trades_cache["dirty"]:
+        return
+    try:
+        import base64
+        cuerpo = {"trades": trades_cache["trades"],
+                  "guardado": hora_ny().strftime("%Y-%m-%d %H:%M ET")}
+        b64 = base64.b64encode(
+            json.dumps(cuerpo, ensure_ascii=False, default=str).encode("utf-8")).decode("ascii")
+        body = {"message": f"Trades {hora_ny().strftime('%Y-%m-%d %H:%M')}", "content": b64}
+        if trades_cache["sha"]:
+            body["sha"] = trades_cache["sha"]
+        req = urllib.request.Request(
+            TRADES_URL, data=json.dumps(body).encode("utf-8"),
+            headers={**_gh_headers(), "Content-Type": "application/json"},
+            method="PUT")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            api = json.loads(resp.read().decode())
+        trades_cache["sha"] = api.get("content", {}).get("sha")
+        trades_cache["dirty"] = False
+        print(f"  [TRADES] 💾 Guardados — {len(trades_cache['trades'])} registros")
+    except Exception as e:
+        print(f"  [TRADES] Error guardando: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# COMANDO /paso — setup visto y NO tomado, anotado EN EL MOMENTO
+# ════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=["paso"])
+def cmd_paso(message):
+    """
+    Uso:  /paso long 7750 no habia confluencia
+          /paso short 7700 dude del nivel
+    Se registra con el contexto del momento (ahora), que es cuando
+    realmente se vio el setup. Es la mitad del aprendizaje: sin los
+    no tomados solo se mide lo que se hizo, no lo que se debió hacer.
+    """
+    try:
+        partes = message.text.split(maxsplit=3)
+        if len(partes) < 3:
+            bot.reply_to(message,
+                "Uso: /paso <long|short> <precio> <motivo>\n"
+                "Ej: /paso long 7750 no habia confluencia")
+            return
+        direccion = partes[1].lower()
+        if direccion not in ("long", "short"):
+            bot.reply_to(message, "La dirección debe ser long o short."); return
+        precio = float(partes[2])
+        motivo = partes[3] if len(partes) > 3 else ""
+
+        ahora = hora_ny()
+        hora_hn = ahora.astimezone(pytz.timezone("America/Tegucigalpa")).strftime("%H:%M")
+        ctx = _snapshot_por_hora(hora_hn)
+
+        trades_cache["trades"].append({
+            "tipo":      "paso",
+            "fecha":     ahora.strftime("%Y-%m-%d"),
+            "hora_hn":   hora_hn,
+            "direccion": direccion,
+            "precio":    precio,
+            "motivo":    motivo,
+            "contexto":  ctx,
+        })
+        trades_cache["dirty"] = True
+        guardar_trades_github()
+
+        reg = ctx.get("regimen") if ctx else None
+        bot.reply_to(message,
+            f"📝 Setup NO tomado registrado\n"
+            f"{direccion.upper()} @ {precio} · {hora_hn} HN\n"
+            f"Régimen: {reg or 'N/D'}\n"
+            f"Motivo: {motivo or '—'}")
+        print(f"  [TRADES] 📝 Paso registrado — {direccion} @ {precio}")
+    except ValueError:
+        bot.reply_to(message, "El precio debe ser un número. Ej: /paso long 7750 sin confluencia")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# DIÁLOGO DE CIERRE — pregunta al terminar la sesión
+# ════════════════════════════════════════════════════════════════
+def iniciar_dialogo_cierre():
+    """Al cerrar el mercado, preguntar si hubo trades."""
+    ahora = hora_ny()
+    if dialogo_cierre["preguntado"] == ahora.date():
+        return
+    if not es_dia_habil(ahora.date()):
+        return
+    dialogo_cierre.update({
+        "activo": True, "paso": "hubo_trades", "dia": ahora.date(),
+        "borrador": {}, "preguntado": ahora.date(),
+    })
+    try:
+        bot.send_message(TELEGRAM_CHAT_ID,
+            "📓 *CIERRE DE SESIÓN*\n"
+            "────────────────────────────\n"
+            "¿Operaste hoy?\n\n"
+            "Respondé *si* o *no*.",
+            parse_mode="Markdown")
+        print("  [TRADES] 📓 Diálogo de cierre iniciado")
+    except Exception as e:
+        print(f"  [TRADES] Error iniciando diálogo: {e}")
+
+
+def _pl_puntos(direccion, entrada, salida):
+    return (salida - entrada) if direccion == "long" else (entrada - salida)
+
+
+@bot.message_handler(
+    func=lambda m: dialogo_cierre["activo"]
+                   and not (m.text or "").startswith("/"))
+def manejar_dialogo_cierre(message):
+    """
+    Máquina de estados del registro. Solo activa tras el cierre.
+    Excluye los mensajes que empiezan con "/" para que los comandos
+    (/paso, /stats, /long, /cerrar...) sigan funcionando aunque el
+    diálogo esté abierto. Para abortar: escribir "cancelar".
+    """
+    txt = (message.text or "").strip()
+    paso = dialogo_cierre["paso"]
+    b = dialogo_cierre["borrador"]
+
+    # Escape manual en cualquier momento
+    if txt.lower() in ("cancelar", "/cancelar", "salir"):
+        dialogo_cierre.update({"activo": False, "paso": None, "borrador": {}})
+        bot.reply_to(message, "Registro cancelado."); return
+
+    try:
+        if paso == "hubo_trades":
+            if txt.lower().startswith("n"):
+                dialogo_cierre.update({"activo": False, "paso": None})
+                pasos_hoy = sum(1 for t in trades_cache["trades"]
+                                if t.get("tipo") == "paso"
+                                and t.get("fecha") == hora_ny().strftime("%Y-%m-%d"))
+                extra = f"\nSetups no tomados registrados hoy: {pasos_hoy}" if pasos_hoy else ""
+                bot.reply_to(message, f"✅ Sesión cerrada sin trades.{extra}")
+                return
+            if txt.lower().startswith("s"):
+                dialogo_cierre["paso"] = "direccion"
+                bot.reply_to(message, "¿Dirección? *long* o *short*", parse_mode="Markdown")
+                return
+            bot.reply_to(message, "Respondé *si* o *no*.", parse_mode="Markdown"); return
+
+        if paso == "direccion":
+            d = txt.lower()
+            if d not in ("long", "short"):
+                bot.reply_to(message, "Escribí *long* o *short*.", parse_mode="Markdown"); return
+            b["direccion"] = d
+            dialogo_cierre["paso"] = "hora_entrada"
+            bot.reply_to(message, "¿Hora de ENTRADA? (HH:MM hora HN)\nEj: `08:14`",
+                         parse_mode="Markdown"); return
+
+        if paso == "hora_entrada":
+            if ":" not in txt:
+                bot.reply_to(message, "Formato HH:MM. Ej: 08:14"); return
+            b["hora_entrada"] = txt
+            dialogo_cierre["paso"] = "precio_entrada"
+            bot.reply_to(message, "¿Precio de ENTRADA?"); return
+
+        if paso == "precio_entrada":
+            b["entrada"] = float(txt.replace(",", "."))
+            dialogo_cierre["paso"] = "hora_salida"
+            bot.reply_to(message, "¿Hora de SALIDA? (HH:MM)"); return
+
+        if paso == "hora_salida":
+            if ":" not in txt:
+                bot.reply_to(message, "Formato HH:MM. Ej: 09:29"); return
+            b["hora_salida"] = txt
+            dialogo_cierre["paso"] = "precio_salida"
+            bot.reply_to(message, "¿Precio de SALIDA?"); return
+
+        if paso == "precio_salida":
+            b["salida"] = float(txt.replace(",", "."))
+            dialogo_cierre["paso"] = "contratos"
+            bot.reply_to(message, "¿Cuántos contratos? Ej: `0.2`", parse_mode="Markdown"); return
+
+        if paso == "contratos":
+            b["contratos"] = float(txt.replace(",", "."))
+            dialogo_cierre["paso"] = "motivo"
+            bot.reply_to(message,
+                "¿Por qué entraste? (una línea)\n"
+                "Ej: `flip abajo como imán, sweeps acelerando`",
+                parse_mode="Markdown"); return
+
+        if paso == "motivo":
+            b["motivo"] = txt
+            # ── Guardar con el contexto de la HORA DE ENTRADA ──
+            ahora = hora_ny()
+            ctx = _snapshot_por_hora(b["hora_entrada"])
+            pl_pts = _pl_puntos(b["direccion"], b["entrada"], b["salida"])
+            registro = {
+                "tipo":        "trade",
+                "fecha":       ahora.strftime("%Y-%m-%d"),
+                "direccion":   b["direccion"],
+                "hora_entrada": b["hora_entrada"],
+                "entrada":     b["entrada"],
+                "hora_salida": b["hora_salida"],
+                "salida":      b["salida"],
+                "contratos":   b["contratos"],
+                "pl_puntos":   round(pl_pts, 2),
+                "motivo":      b["motivo"],
+                "contexto":    ctx,     # régimen, niveles y flujo de ESA hora
+            }
+            trades_cache["trades"].append(registro)
+            trades_cache["dirty"] = True
+            guardar_trades_github()
+
+            emoji = "✅" if pl_pts > 0 else ("➖" if pl_pts == 0 else "❌")
+            if ctx:
+                ctx_txt = (f"\n📊 Contexto {b['hora_entrada']}:"
+                           f"\n   Régimen: `{ctx.get('regimen') or 'N/D'}`"
+                           f"\n   Flip:`{ctx.get('flip')}` Call:`{ctx.get('call_wall')}` "
+                           f"Put:`{ctx.get('put_wall')}`"
+                           f"\n   Balance: `${(ctx.get('balance') or 0)/1e6:,.0f}M`"
+                           f" · Δ `${(ctx.get('dBal') or 0)/1e6:+,.0f}M`")
+            else:
+                ctx_txt = "\n⚠️ Sin contexto para esa hora (fuera del horario registrado)"
+
+            bot.reply_to(message,
+                f"{emoji} *Trade registrado*\n"
+                f"{b['direccion'].upper()} {b['entrada']} → {b['salida']}\n"
+                f"Resultado: `{pl_pts:+.1f}` pts · {b['contratos']} contratos"
+                f"{ctx_txt}\n\n"
+                f"¿Otro trade? *si* / *no*",
+                parse_mode="Markdown")
+            dialogo_cierre["paso"] = "otro"
+            dialogo_cierre["borrador"] = {}
+            return
+
+        if paso == "otro":
+            if txt.lower().startswith("s"):
+                dialogo_cierre["paso"] = "direccion"
+                bot.reply_to(message, "¿Dirección? *long* o *short*", parse_mode="Markdown")
+                return
+            dialogo_cierre.update({"activo": False, "paso": None})
+            hoy = hora_ny().strftime("%Y-%m-%d")
+            dia = [t for t in trades_cache["trades"]
+                   if t.get("fecha") == hoy and t.get("tipo") == "trade"]
+            neto = sum(t.get("pl_puntos", 0) for t in dia)
+            bot.reply_to(message,
+                f"✅ *Sesión cerrada*\n"
+                f"{len(dia)} trade(s) · neto `{neto:+.1f}` pts",
+                parse_mode="Markdown")
+            return
+
+    except ValueError:
+        bot.reply_to(message, "Eso no es un número válido. Probá de nuevo.")
+    except Exception as e:
+        dialogo_cierre.update({"activo": False, "paso": None, "borrador": {}})
+        bot.reply_to(message, f"Error, registro cancelado: {e}")
+
+
+# ════════════════════════════════════════════════════════════════
+# COMANDO /stats — resumen del registro
+# ════════════════════════════════════════════════════════════════
+@bot.message_handler(commands=["stats"])
+def cmd_stats(message):
+    """Resumen de los trades registrados, cortado por hora y régimen."""
+    try:
+        ts = [t for t in trades_cache["trades"] if t.get("tipo") == "trade"]
+        if not ts:
+            bot.reply_to(message, "Todavía no hay trades registrados."); return
+
+        n = len(ts)
+        wins = [t for t in ts if t.get("pl_puntos", 0) > 0]
+        neto = sum(t.get("pl_puntos", 0) for t in ts)
+        prom_w = (sum(t["pl_puntos"] for t in wins)/len(wins)) if wins else 0
+        perd = [t for t in ts if t.get("pl_puntos", 0) < 0]
+        prom_p = (sum(t["pl_puntos"] for t in perd)/len(perd)) if perd else 0
+
+        lineas = [f"📓 *REGISTRO DE TRADES*",
+                  f"{'─'*28}",
+                  f"Total: `{n}` · Win rate: `{len(wins)/n*100:.0f}%`",
+                  f"Neto: `{neto:+.1f}` pts",
+                  f"Ganador medio: `{prom_w:+.1f}` · Perdedor medio: `{prom_p:+.1f}`"]
+
+        # Por franja horaria — mide si la ventana de la mañana rinde más
+        def franja(t):
+            try:
+                h = int(t.get("hora_entrada","00:00").split(":")[0])
+                return "mañana (7-10)" if h < 10 else "tarde (10+)"
+            except Exception:
+                return "s/d"
+        porf = {}
+        for t in ts:
+            porf.setdefault(franja(t), []).append(t.get("pl_puntos", 0))
+        if len(porf) > 1:
+            lineas.append(f"{'─'*28}\n*Por franja:*")
+            for f, v in porf.items():
+                w = sum(1 for x in v if x > 0)
+                lineas.append(f"  {f}: n=`{len(v)}` · {w/len(v)*100:.0f}% · "
+                              f"neto `{sum(v):+.1f}` pts")
+
+        # Por régimen de gamma
+        porr = {}
+        for t in ts:
+            c = t.get("contexto") or {}
+            r = c.get("regimen")
+            if r: porr.setdefault(r, []).append(t.get("pl_puntos", 0))
+        if porr:
+            lineas.append(f"{'─'*28}\n*Por régimen:*")
+            for r, v in porr.items():
+                w = sum(1 for x in v if x > 0)
+                lineas.append(f"  gamma {r.lower()}: n=`{len(v)}` · {w/len(v)*100:.0f}% · "
+                              f"neto `{sum(v):+.1f}` pts")
+
+        pasos = [t for t in trades_cache["trades"] if t.get("tipo") == "paso"]
+        if pasos:
+            lineas.append(f"{'─'*28}\nSetups no tomados: `{len(pasos)}`")
+
+        # Con pocos trades cualquier porcentaje es ruido — decirlo explícito
+        if n < 30:
+            lineas.append(f"\n_Muestra chica (n={n}); los porcentajes todavía no son "
+                          f"conclusiones._")
+
+        bot.reply_to(message, "\n".join(lineas), parse_mode="Markdown")
+    except Exception as e:
+        bot.reply_to(message, f"Error: {e}")
     
 def _regimen_gamma(vix_nivel=None):
     """
@@ -3326,7 +4244,7 @@ def evaluar_detector_rango(precio_actual, gamma_flip):
             centro_rango = precio_actual
 
     distancia_flip = abs(precio_actual - centro_rango)
-    en_rango = distancia_flip <= RANGO_MAXIMO_PUNTOS / 2
+    en_rango = distancia_flip <= umbrales["rango_pts"] / 2
     if en_rango:
         if not detector_rango["activo"]:
             detector_rango["activo"]        = True
@@ -5253,7 +6171,10 @@ print("  [INIT] Restaurando estado COT Estimado desde GitHub...")
 cargar_estado_cot_github()
 print("  [INIT] Restaurando trayectoria weekly...")
 cargar_weekly_github()
-
+print("  [INIT] Cargando registro de trades...")
+cargar_trades_github()
+print("  [INIT] Cargando calibración de umbrales...")
+cargar_calibracion_github()
 while True:
     try:
         inicio_ciclo = time.time()
@@ -5286,6 +6207,10 @@ while True:
                 guardar_journal_github()
                 # Persistir estado COT (acumulación del día)
                 guardar_estado_cot_github()
+                # Resumen del día para recalibrar los umbrales
+                acumular_dia_calibracion(ahora_ny)
+                # Preguntar por los trades del día
+                iniciar_dialogo_cierre() 
 
 # ── Weekly direccional — también con mercado cerrado ──
             # El OI ya está publicado del cierre anterior, así que el
@@ -5618,6 +6543,13 @@ while True:
                 # para que la web tenga la trayectoria completa del balance.
                 # No bloquea el loop: corre en un thread daemon con timeout
                 # corto y try/except silencioso.
+                                # Foto del mercado en esta lectura — es lo que permite
+                # reconstruir después las condiciones de la hora exacta
+                # en que se entró a un trade.
+                try:
+                    registrar_lectura_contexto(ahora_ny, spy_precio, sweep, balance_actual)
+                except Exception as e:
+                    print(f"  [TRADES] Error contexto: {e}")
                 try:
                     enviar_sweep_dashboard(sweep, balance_actual, ahora_ny, spy_precio)
                 except Exception as e:
